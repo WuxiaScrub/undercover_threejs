@@ -1,0 +1,34 @@
+{
+  "name": "undercover-threejs",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "server": "tsx watch src/server/server.ts",
+    "play": "node scripts/play.mjs",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host",
+    "typecheck": "tsc --noEmit",
+    "test:combat": "tsx scripts/combat-matrix.ts",
+    "test:guards": "tsx scripts/guard-tests.ts",
+    "test:nav": "tsx scripts/nav-tests.ts",
+    "test:doors": "tsx scripts/door-tests.ts",
+    "test:round": "tsx scripts/round-tests.ts",
+    "test:duty": "tsx scripts/duty-tests.ts",
+    "test:assets": "tsx scripts/asset-check.ts",
+    "test": "tsc --noEmit && tsx scripts/combat-matrix.ts && tsx scripts/guard-tests.ts && tsx scripts/nav-tests.ts && tsx scripts/door-tests.ts && tsx scripts/round-tests.ts && tsx scripts/duty-tests.ts && tsx scripts/asset-check.ts"
+  },
+  "dependencies": {
+    "three": "^0.180.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "@types/three": "^0.180.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.23.13",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}

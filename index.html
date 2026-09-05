@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%234a5140'/%3E%3Crect x='4' y='4' width='8' height='8' fill='%23c2a882'/%3E%3C/svg%3E"
+    />
+    <title>Compound — Prototype</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #101210;
+        font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+        color: #e8e4d8;
+      }
+      canvas {
+        display: block;
+      }
+      #overlay {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        background: rgba(12, 14, 12, 0.85);
+        cursor: pointer;
+        z-index: 10;
+        text-align: center;
+      }
+      #overlay h1 {
+        font-size: 20px;
+        letter-spacing: 3px;
+        margin: 0;
+        font-weight: 600;
+      }
+      #overlay p {
+        margin: 0;
+        font-size: 12px;
+        line-height: 1.9;
+        color: #a8a597;
+      }
+      #overlay.hidden {
+        display: none;
+      }
+      #debug {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        font-size: 11px;
+        line-height: 1.5;
+        white-space: pre;
+        color: #b8f0a0;
+        text-shadow: 0 1px 2px #000;
+        pointer-events: none;
+        z-index: 5;
+      }
+      #hud {
+        position: fixed;
+        left: 50%;
+        bottom: 24px;
+        transform: translateX(-50%);
+        width: 260px;
+        text-align: center;
+        z-index: 4;
+        pointer-events: none;
+      }
+      #hud-role {
+        font-size: 11px;
+        letter-spacing: 2px;
+        color: #d6d0be;
+        text-shadow: 0 1px 2px #000;
+        margin-bottom: 6px;
+      }
+      #hud-stamina {
+        height: 6px;
+        background: rgba(0, 0, 0, 0.55);
+        border: 1px solid rgba(232, 228, 216, 0.35);
+        overflow: hidden;
+      }
+      #hud-stamina-fill {
+        height: 100%;
+        width: 100%;
+        background: #9ec27a;
+        transition: background-color 0.2s;
+      }
+      #hud-stamina.draining #hud-stamina-fill {
+        background: #d8c46a;
+      }
+      #hud-stamina.exhausted #hud-stamina-fill {
+        background: #c46a5a;
+      }
+      #hud-health {
+        height: 10px;
+        margin-bottom: 4px;
+        background: rgba(0, 0, 0, 0.55);
+        border: 1px solid rgba(232, 228, 216, 0.35);
+        overflow: hidden;
+      }
+      #hud-health-fill {
+        height: 100%;
+        width: 100%;
+        background: #b8503f;
+        transition: width 0.12s linear;
+      }
+      #hud-weapon {
+        margin-top: 6px;
+        font-size: 12px;
+        letter-spacing: 1px;
+        color: #d6d0be;
+        text-shadow: 0 1px 2px #000;
+      }
+      #hud-weapon .conceal {
+        color: #8f8c80;
+      }
+      #hud-weapon .empty {
+        color: #c46a5a;
+      }
+      #hud-kit {
+        margin-top: 3px;
+        font-size: 10px;
+        letter-spacing: 1px;
+        color: #8f8c80;
+        text-shadow: 0 1px 2px #000;
+      }
+      #prompt {
+        position: fixed;
+        left: 50%;
+        top: 56%;
+        transform: translateX(-50%);
+        font-size: 12px;
+        letter-spacing: 1px;
+        color: #e8e4d8;
+        text-shadow: 0 1px 3px #000;
+        opacity: 0;
+        pointer-events: none;
+        z-index: 5;
+        transition: opacity 0.1s;
+      }
+      #prompt.show {
+        opacity: 1;
+      }
+      #alerts {
+        position: fixed;
+        left: 50%;
+        top: 14%;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+        pointer-events: none;
+        z-index: 5;
+      }
+      #alerts .alert {
+        font-size: 13px;
+        letter-spacing: 1px;
+        color: #e8c47a;
+        text-shadow: 0 1px 3px #000;
+      }
+      #hitmarker {
+        position: fixed;
+        left: 50%;
+        top: 50%;
+        width: 22px;
+        height: 22px;
+        margin: -11px 0 0 -11px;
+        opacity: 0;
+        pointer-events: none;
+        z-index: 6;
+      }
+      #hitmarker::before,
+      #hitmarker::after {
+        content: '';
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 16px;
+        height: 2px;
+        margin: -1px 0 0 -8px;
+        background: #f2eee0;
+      }
+      #hitmarker::before {
+        transform: rotate(45deg);
+      }
+      #hitmarker::after {
+        transform: rotate(-45deg);
+      }
+      #hitmarker.show {
+        opacity: 1;
+      }
+      #hitmarker.lethal::before,
+      #hitmarker.lethal::after {
+        background: #e05a44;
+      }
+      #hurt {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        opacity: 0;
+        z-index: 3;
+        background: radial-gradient(ellipse at center, transparent 45%, rgba(150, 20, 10, 0.75) 100%);
+        transition: opacity 0.35s ease-out;
+      }
+      #hurt.show {
+        opacity: 1;
+        transition: opacity 0.05s;
+      }
+      /* Round state: phase + clock, centred at the top where nothing else is. */
+      #round {
+        position: fixed;
+        top: 12px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        gap: 3px;
+        padding: 6px 16px;
+        background: rgba(12, 12, 14, 0.6);
+        border: 1px solid rgba(220, 210, 180, 0.18);
+        border-radius: 3px;
+        z-index: 6;
+        pointer-events: none;
+        text-align: center;
+      }
+      #round.show {
+        display: flex;
+      }
+      #round-phase {
+        font-size: 11px;
+        letter-spacing: 3px;
+        color: #cdc7b6;
+      }
+      #round-clock {
+        font-size: 20px;
+        letter-spacing: 2px;
+        color: #f0e9d2;
+      }
+      /* Your own allegiance, and nobody else's — CLAUDE.md §30. */
+      #round-faction {
+        font-size: 11px;
+        letter-spacing: 3px;
+      }
+      #round-faction.loyalist {
+        color: #7fb069;
+      }
+      #round-faction.infiltrator {
+        color: #e05a44;
+      }
+      /* The Security Officer's patrol. Only ever on his own screen. */
+      #duty {
+        font-size: 11px;
+        letter-spacing: 2px;
+        color: #d8c46a;
+      }
+      #duty.late {
+        color: #e05a44;
+      }
+      #duty.arriving {
+        color: #9ec27a;
+      }
+      #result {
+        position: fixed;
+        inset: 0;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        background: rgba(10, 10, 14, 0.72);
+        z-index: 8;
+        pointer-events: none;
+        text-align: center;
+      }
+      #result.show {
+        display: flex;
+      }
+      #result h2 {
+        margin: 0;
+        font-size: 26px;
+        letter-spacing: 6px;
+        color: #f0e9d2;
+      }
+      #result p {
+        margin: 0;
+        font-size: 13px;
+        color: #cdc7b6;
+      }
+      #result-reveal {
+        margin-top: 8px;
+        font-size: 12px;
+        line-height: 1.7;
+        color: #cdc7b6;
+      }
+      #result-reveal .infiltrator {
+        color: #e05a44;
+      }
+      #result-reveal .loyalist {
+        color: #7fb069;
+      }
+      #death {
+        position: fixed;
+        inset: 0;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        background: rgba(20, 6, 4, 0.55);
+        z-index: 7;
+        pointer-events: none;
+        text-align: center;
+      }
+      #death.show {
+        display: flex;
+      }
+      #death h2 {
+        margin: 0;
+        font-size: 24px;
+        letter-spacing: 6px;
+        color: #e05a44;
+      }
+      #death p {
+        margin: 0;
+        font-size: 13px;
+        color: #cdc7b6;
+      }
+      #net-panel {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+        padding: 14px 18px;
+        border: 1px solid rgba(232, 228, 216, 0.18);
+        background: rgba(0, 0, 0, 0.3);
+        cursor: default;
+      }
+      #net-panel .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      #net-panel input {
+        font: inherit;
+        font-size: 12px;
+        padding: 5px 7px;
+        color: #e8e4d8;
+        background: rgba(0, 0, 0, 0.45);
+        border: 1px solid rgba(232, 228, 216, 0.25);
+      }
+      #net-panel button {
+        font: inherit;
+        font-size: 11px;
+        letter-spacing: 1px;
+        padding: 6px 12px;
+        color: #e8e4d8;
+        background: rgba(232, 228, 216, 0.1);
+        border: 1px solid rgba(232, 228, 216, 0.3);
+        cursor: pointer;
+      }
+      #net-panel button:hover {
+        background: rgba(232, 228, 216, 0.2);
+      }
+      #net-status {
+        font-size: 11px;
+        color: #8f8c80;
+      }
+      #net-status[data-status='online'] {
+        color: #9ec27a;
+      }
+      #net-status[data-status='error'] {
+        color: #c46a5a;
+      }
+      #crosshair {
+        position: fixed;
+        left: 50%;
+        top: 50%;
+        width: 4px;
+        height: 4px;
+        margin: -2px 0 0 -2px;
+        background: #e8e4d8;
+        border-radius: 50%;
+        opacity: 0.6;
+        pointer-events: none;
+        z-index: 4;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="hurt"></div>
+    <div id="crosshair"></div>
+    <div id="hitmarker"></div>
+    <div id="prompt"></div>
+    <div id="alerts"></div>
+    <div id="debug"></div>
+    <div id="round">
+      <div id="round-phase"></div>
+      <div id="round-clock"></div>
+      <div id="round-faction"></div>
+      <div id="duty"></div>
+    </div>
+    <div id="result">
+      <h2 id="result-winner"></h2>
+      <p id="result-reason"></p>
+      <div id="result-reveal"></div>
+    </div>
+    <div id="death">
+      <h2>KILLED</h2>
+      <p id="death-detail"></p>
+    </div>
+    <div id="hud">
+      <div id="hud-role">DOCTOR</div>
+      <div id="hud-health"><div id="hud-health-fill"></div></div>
+      <div id="hud-stamina"><div id="hud-stamina-fill"></div></div>
+      <div id="hud-weapon">UNARMED</div>
+      <div id="hud-kit">CARRYING NOTHING</div>
+    </div>
+    <div id="overlay">
+      <h1>MILITARY COMPOUND</h1>
+      <p>
+        click to play<br />
+        WASD move &nbsp;·&nbsp; SHIFT sprint &nbsp;·&nbsp; SPACE jump &nbsp;·&nbsp; MOUSE look<br />
+        LMB shoot / strike &nbsp;·&nbsp; RMB draw / put away &nbsp;·&nbsp; SCROLL switch weapon<br />
+        E use / doors &nbsp;·&nbsp; G discard &nbsp;·&nbsp; R reload<br />
+        F1 collision &nbsp;·&nbsp; F2 hitboxes &nbsp;·&nbsp; F3 guard vision &nbsp;·&nbsp; F4 faction
+        &nbsp;·&nbsp; F5 role &nbsp;·&nbsp; F6/F7 arm &nbsp;·&nbsp; F8 reset &nbsp;·&nbsp; F9
+        unstick<br />
+        B spawn target &nbsp;·&nbsp; N target role &nbsp;·&nbsp; V target weapon &nbsp;·&nbsp; M clear
+        targets &nbsp;·&nbsp; ESC release mouse
+      </p>
+      <div id="net-panel">
+        <div class="row">
+          <input id="net-name" placeholder="name" maxlength="16" size="12" />
+          <input id="net-address" placeholder="ws://host:3000" size="22" />
+        </div>
+        <div class="row">
+          <button id="net-connect">connect</button>
+          <button id="net-offline">play solo</button>
+        </div>
+        <div id="net-status">offline — solo</div>
+      </div>
+    </div>
+    <script type="module" src="/src/client/main.ts"></script>
+  </body>
+</html>
