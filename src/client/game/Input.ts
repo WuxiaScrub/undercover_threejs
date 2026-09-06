@@ -15,6 +15,28 @@ export class Input {
   /** Fired when the pointer is locked — the user gesture audio needs. */
   onPointerLock: () => void = () => {};
 
+  // ----------------------------------------------------------- text-capture mode (chat)
+  private _textMode = false;
+  private _textBuffer = '';
+  /** Called when the player submits a chat message (Enter) or cancels (Escape). */
+  onTextSubmit: ((text: string | null) => void) | null = null;
+
+  get textMode(): boolean { return this._textMode; }
+  get textBuffer(): string { return this._textBuffer; }
+
+  enterTextMode(): void {
+    this._textMode = true;
+    this._textBuffer = '';
+    this.down.clear();
+  }
+
+  private exitTextMode(submit: boolean): void {
+    this._textMode = false;
+    const text = this._textBuffer;
+    this._textBuffer = '';
+    if (this.onTextSubmit) this.onTextSubmit(submit ? text : null);
+  }
+
   constructor(
     private readonly canvas: HTMLElement,
     private readonly overlay: HTMLElement,
@@ -85,6 +107,14 @@ export class Input {
   };
 
   private readonly onKeyDown = (e: KeyboardEvent) => {
+    if (this._textMode) {
+      e.preventDefault();
+      if (e.code === 'Enter') { this.exitTextMode(true); return; }
+      if (e.code === 'Escape' || e.code === 'Backquote') { this.exitTextMode(false); return; }
+      if (e.code === 'Backspace') { this._textBuffer = this._textBuffer.slice(0, -1); return; }
+      if (e.key.length === 1) this._textBuffer += e.key;
+      return;
+    }
     // F-keys are debug controls; stop the browser from stealing them.
     if (/^F\d+$/.test(e.code)) e.preventDefault();
     if (e.repeat) return;

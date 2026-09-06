@@ -8,7 +8,7 @@ import { moveBody } from '../src/shared/collision';
 import { HITBOXES, type HitRegion } from '../src/shared/hitbox';
 import { COMPOUND } from '../src/shared/mapData';
 import { ROLE_ORDER, ROLE_STATS } from '../src/shared/roles';
-import { canCarry, WEAPONS, type WeaponId } from '../src/shared/weapons';
+import { canCarry, canConceal, WEAPONS, type WeaponId } from '../src/shared/weapons';
 
 let failures = 0;
 function check(label: string, ok: boolean, detail = ''): void {
@@ -168,16 +168,25 @@ console.log('\n=== rifle reach and accuracy vs the pistol ===');
     rifle.speedMultiplier < pistol.speedMultiplier,
     `x${rifle.speedMultiplier} vs x${pistol.speedMultiplier}`,
   );
+  // The rifle is not gated at pickup — a doctor who finds a dead guard's rifle
+  // may take it. The gate is CONCEALMENT: he cannot put it away, so he is
+  // visibly armed from the moment he picks it up and every guard who sees him
+  // reacts. That is the trade the weapon exists to offer (CLAUDE.md §11, §22).
   check(
-    'only the Security Officer may pick a rifle up',
-    canCarry('security', 'rifle') &&
-      !canCarry('doctor', 'rifle') &&
-      !canCarry('secretary', 'rifle') &&
-      !canCarry('telegram', 'rifle'),
+    'anyone may pick a rifle up',
+    ROLE_ORDER.every((r) => canCarry(r, 'rifle')),
+  );
+  check(
+    'but only the two armed roles can put one away',
+    canConceal('security', 'rifle') &&
+      canConceal('guard', 'rifle') &&
+      !canConceal('doctor', 'rifle') &&
+      !canConceal('secretary', 'rifle') &&
+      !canConceal('telegram', 'rifle'),
   );
   check(
     'a pistol is something anyone can pocket',
-    ROLE_ORDER.every((r) => canCarry(r, 'pistol')),
+    ROLE_ORDER.every((r) => canCarry(r, 'pistol') && canConceal(r, 'pistol')),
   );
 
   const torso = HITBOXES.find((h) => h.region === 'torso')!;

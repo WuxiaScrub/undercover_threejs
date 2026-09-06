@@ -1,6 +1,7 @@
 import { GAME_CONFIG } from '../../shared/constants';
 import type { DutyStatus } from '../../shared/duty';
 import { FACTION_NAME, type Faction } from '../../shared/factions';
+import { ITEMS, type ItemId } from '../../shared/inventory';
 import type { RoundPhase, ServerMessage } from '../../shared/net';
 import { ROLE_STATS, type RoleStats } from '../../shared/roles';
 import { WEAPONS } from '../../shared/weapons';
@@ -40,6 +41,24 @@ export class HUD {
   private readonly resultWinner: HTMLElement;
   private readonly resultReason: HTMLElement;
   private readonly resultReveal: HTMLElement;
+  private readonly reportPanel: HTMLElement;
+  private readonly reportTruth: HTMLElement;
+  private readonly reportList: HTMLElement;
+  private reportOpen = false;
+  private readonly inventoryPanel: HTMLElement;
+  private readonly inventoryList: HTMLElement;
+  private inventoryOpen = false;
+  private inventoryItems: ItemId[] = [];
+  private inventorySelected = 0;
+
+  // chat
+  private readonly chatLog: HTMLElement;
+  private readonly chatInputRow: HTMLElement;
+  private readonly chatPromptLabel: HTMLElement;
+  private readonly chatInputText: HTMLElement;
+  private readonly searchProgress: HTMLElement;
+  private readonly searchLabel: HTMLElement;
+  private readonly searchBarFill: HTMLElement;
 
   /**
    * YOUR allegiance. Kept here rather than passed in every frame because it is
@@ -75,6 +94,18 @@ export class HUD {
     this.resultWinner = document.getElementById('result-winner')!;
     this.resultReason = document.getElementById('result-reason')!;
     this.resultReveal = document.getElementById('result-reveal')!;
+    this.reportPanel = document.getElementById('report')!;
+    this.reportTruth = document.getElementById('report-truth')!;
+    this.reportList = document.getElementById('report-list')!;
+    this.inventoryPanel = document.getElementById('inventory')!;
+    this.inventoryList = document.getElementById('inventory-list')!;
+    this.chatLog = document.getElementById('chat-log')!;
+    this.chatInputRow = document.getElementById('chat-input-row')!;
+    this.chatPromptLabel = document.getElementById('chat-prompt-label')!;
+    this.chatInputText = document.getElementById('chat-input-text')!;
+    this.searchProgress = document.getElementById('search-progress')!;
+    this.searchLabel = document.getElementById('search-label')!;
+    this.searchBarFill = document.getElementById('search-bar-fill')!;
   }
 
   // ---------------------------------------------------------------- the round
@@ -114,12 +145,18 @@ export class HUD {
 
     const dwelling = duty.dwell > 0;
     const left = Math.ceil(GAME_CONFIG.duty.patrolDwellSeconds - duty.dwell);
-    this.duty.textContent = dwelling
-      ? `PATROL: ${duty.label} — HOLD ${Math.max(1, left)}`
-      : duty.ok
-        ? `PATROL: ${duty.label} — ${clock(duty.secondsLeft)}`
-        : `PATROL OVERDUE: ${duty.label} — SEARCH DISABLED`;
-    this.duty.className = dwelling ? 'arriving' : duty.ok ? '' : 'late';
+    if (duty.secondsLeft === 0 && !dwelling) {
+      // Non-security role: show label + optional detail
+      this.duty.textContent = duty.detail ? `${duty.label}: ${duty.detail}` : duty.label;
+      this.duty.className = '';
+    } else {
+      this.duty.textContent = dwelling
+        ? `PATROL: ${duty.label} — HOLD ${Math.max(1, left)}`
+        : duty.ok
+          ? `PATROL: ${duty.label} — ${clock(duty.secondsLeft)}`
+          : `PATROL OVERDUE: ${duty.label} — SEARCH DISABLED`;
+      this.duty.className = dwelling ? 'arriving' : duty.ok ? '' : 'late';
+    }
   }
 
   /**
@@ -184,7 +221,6 @@ export class HUD {
     this.staminaBar.classList.toggle('draining', sprinting);
     this.healthFill.style.width = `${clamp01(healthFraction) * 100}%`;
     this.weaponLabel.innerHTML = weaponText(weapons);
-    this.kitLabel.textContent = kitText(weapons);
   }
 
   /**
@@ -228,6 +264,128 @@ export class HUD {
     this.death.classList.toggle('show', dead);
     this.deathDetail.textContent = detail;
   }
+
+  // --------------------------------------------------------- inventory panel
+
+  /** Update the item list shown in the inventory panel. */
+  syncInventory(items: ItemId[]): void {
+    this.inventoryItems = items;
+    if (this.inventorySelected >= items.length) this.inventorySelected = 0;
+    if (this.inventoryOpen) this.renderInventory();
+    // Always update the kit line in the HUD.
+    this.kitLabel.textContent = kitText(items);
+  }
+
+  /** Toggle or force open/closed. Returns the new state. */
+  toggleInventory(forceOpen?: boolean): boolean {
+    this.inventoryOpen = forceOpen !== undefined ? forceOpen : !this.inventoryOpen;
+    this.inventoryPanel.classList.toggle('show', this.inventoryOpen);
+    if (this.inventoryOpen) this.renderInventory();
+    return this.inventoryOpen;
+  }
+
+  /** Move selection up or down and return the new selected ItemId (or null). */
+  selectInventory(delta: number): ItemId | null {
+    if (this.inventoryItems.length === 0) return null;
+    this.inventorySelected = (this.inventorySelected + delta + this.inventoryItems.length) % this.inventoryItems.length;
+    this.renderInventory();
+    return this.inventoryItems[this.inventorySelected] ?? null;
+  }
+
+  /** The currently selected item (or null when inventory is empty). */
+  selectedItem(): ItemId | null {
+    return this.inventoryItems[this.inventorySelected] ?? null;
+  }
+
+  isInventoryOpen(): boolean {
+    return this.inventoryOpen;
+  }
+
+  // --------------------------------------------------------------- the report
+
+  /**
+   * Open the signals report (CLAUDE.md §33).
+   *
+   * The truth line is what the intelligence actually says; the numbered list is
+   * everyone the operator may denounce with it. Players and NPCs are mixed and
+   * nothing here distinguishes them — the panel is deliberately unable to tell
+   * the reader which candidates are human.
+   */
+  showReport(truth: string, candidates: readonly { id: number; label: string }[]): void {
+    this.reportOpen = true;
+    this.reportPanel.classList.add('show');
+    this.reportTruth.textContent = `${truth} IS AN INFILTRATOR`;
+    this.reportList.replaceChildren(
+      ...candidates.slice(0, 9).map((c, i) => {
+        const row = document.createElement('div');
+        row.className = 'report-row';
+        row.textContent = `[${i + 1}]  ${c.label}`;
+        return row;
+      }),
+    );
+  }
+
+  hideReport(): void {
+    this.reportOpen = false;
+    this.reportPanel.classList.remove('show');
+  }
+
+  isReportOpen(): boolean {
+    return this.reportOpen;
+  }
+
+  // ----------------------------------------------------------- chat
+
+  /**
+   * The text line at the bottom left. Proximity chat is off for this build, so
+   * in practice its only caller is the telegram decipher (plan M6) — hence the
+   * label, which used to be a hard-coded `~`.
+   */
+  showChatInput(show: boolean, buffer = '', label = '~'): void {
+    this.chatInputRow.classList.toggle('show', show);
+    this.chatPromptLabel.textContent = label;
+    this.chatInputText.textContent = buffer + (show ? '|' : '');
+  }
+
+  addChatLine(name: string, text: string, channel: 'local' | 'broadcast'): void {
+    const line = document.createElement('div');
+    line.className = `chat-line${channel === 'broadcast' ? ' broadcast' : ''}`;
+    line.textContent = channel === 'broadcast' ? `[TELEGRAPH] ${name}: ${text}` : `${name}: ${text}`;
+    this.chatLog.prepend(line);
+    // Fade after 8 seconds.
+    setTimeout(() => line.classList.add('fading'), 7500);
+    setTimeout(() => line.remove(), 8500);
+    // Keep at most 8 lines.
+    while (this.chatLog.childElementCount > 8) this.chatLog.lastElementChild?.remove();
+  }
+
+  // ---------------------------------------------------------- search progress
+
+  setSearchProgress(fraction: number | null, label = 'SEARCHING…'): void {
+    const show = fraction !== null;
+    this.searchProgress.classList.toggle('show', show);
+    if (show) {
+      this.searchLabel.textContent = label;
+      this.searchBarFill.style.width = `${Math.min(1, fraction!) * 100}%`;
+    }
+  }
+
+  private renderInventory(): void {
+    this.inventoryList.replaceChildren(
+      ...this.inventoryItems.map((id, i) => {
+        const row = document.createElement('div');
+        row.className = `inv-row${i === this.inventorySelected ? ' selected' : ''}`;
+        row.textContent = `[${i + 1}]  ${ITEMS[id].name.toUpperCase()}`;
+        return row;
+      }),
+    );
+    if (this.inventoryItems.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'inv-empty';
+      empty.textContent = 'EMPTY';
+      this.inventoryList.replaceChildren(empty);
+    }
+  }
 }
 
 function weaponText(weapons: WeaponSystem): string {
@@ -247,10 +405,9 @@ function weaponText(weapons: WeaponSystem): string {
 }
 
 /** Everything carried, held or not — visible to you alone (CLAUDE.md §16). */
-function kitText(weapons: WeaponSystem): string {
-  const kit = weapons.inventory;
-  if (kit.length === 0) return 'CARRYING NOTHING';
-  return `CARRYING ${kit.map((id) => WEAPONS[id].name.toUpperCase()).join(' · ')}`;
+function kitText(items: ItemId[]): string {
+  if (items.length === 0) return 'CARRYING NOTHING';
+  return `CARRYING ${items.map((id) => ITEMS[id].name.toUpperCase()).join(' · ')}`;
 }
 
 /** m:ss, floored at zero — a negative clock reads as a bug, not as overtime. */

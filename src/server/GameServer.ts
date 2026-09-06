@@ -1,9 +1,19 @@
 import type { WebSocket, WebSocketServer } from 'ws';
 import { GAME_CONFIG } from '../shared/constants';
-import { doorById, DoorField } from '../shared/doors';
-import { PatrolDuty } from '../shared/duty';
+import { doorById, doorPermits, DoorField } from '../shared/doors';
+import { DeliveryDuty, PatrolDuty, medicalStatus, type DutyStatus } from '../shared/duty';
+import { ITEMS, isWeaponItem } from '../shared/inventory';
 import { ItemField } from '../shared/items';
-import { COMPOUND, HIDDEN_PISTOL_SPOTS } from '../shared/mapData';
+import { ContainerField } from '../shared/containers';
+import { PatientSystem } from '../shared/medical';
+import { TelegramSystem } from '../shared/telegrams';
+import {
+  COMPOUND,
+  CONTAINERS,
+  GUARD_SPAWNS,
+  HIDDEN_PISTOL_SPOTS,
+  ROLE_SPAWNS,
+} from '../shared/mapData';
 import {
   NET_CONFIG,
   PROTOCOL_VERSION,
@@ -13,11 +23,12 @@ import {
   type ServerMessage,
 } from '../shared/net';
 import { ROLE_STATS, type Role } from '../shared/roles';
-import { canCarry, WEAPONS, type WeaponId } from '../shared/weapons';
+import { canCarry, canConceal, WEAPONS, type WeaponId } from '../shared/weapons';
 import { CombatSystem, type CombatOutcome } from './CombatSystem';
 import { GuardSystem } from './GuardSystem';
 import { PlayerState } from './PlayerState';
 import { RoundSystem } from './RoundSystem';
+import { SEARCH_REFUSAL_TEXT, SearchSystem, type ActiveSearch } from './SearchSystem';
 
 /** How many of the candidate spots actually get a pistol (CLAUDE.md §23). */
 const HIDDEN_PISTOL_COUNT = 3;
@@ -45,10 +56,17 @@ export class GameServer {
   private readonly round = new RoundSystem();
   /**
    * Patrol duties, keyed by player id — in practice one entry, the Security
-   * Officer's. When the search ability lands it reads `searchEnabled` off this
-   * map; until then the flag exists, is enforced by the duty, and is displayed.
+   * Officer's. `SearchSystem` reads `searchEnabled` off this map, which is the
+   * whole reason the patrol exists: it is the only thing that can take the
+   * search away, and walking a checkpoint gives it straight back (CLAUDE.md §15).
    */
   private readonly duties = new Map<number, PatrolDuty>();
+  /** Dispatch runs, keyed by player id — the Secretary's (CLAUDE.md §32). */
+  private readonly deliveries = new Map<number, DeliveryDuty>();
+  private readonly search = new SearchSystem();
+  private readonly containers = new ContainerField();
+  private readonly patients = new PatientSystem();
+  private readonly telegrams = new TelegramSystem();
   private nextId = 1;
   private spawnCursor = 0;
   private readonly startedAt = Date.now();
@@ -97,6 +115,9 @@ export class GameServer {
     const state = conn.state;
     if (!state) return;
     conn.state = null;
+    // A hold cannot survive one of its two parties walking out of the building.
+    const dropped = this.search.abort(state.id, this.livePlayers(), Date.now());
+    if (dropped) this.sendSearch(dropped, 'end');
     this.broadcast({ t: 'left', id: state.id });
     // The lobby line counts heads, so it goes stale the moment one leaves.
     this.announceRound(this.livePlayers(), Date.now());
@@ -153,10 +174,14 @@ export class GameServer {
         // Max health is per role, so switching role has to reset it or the
         // damage rules stop meaning what they say.
         state.setRole(msg.role);
+        // Re-apply the rifle-visibility rule after a role change.
+        if (state.inventory.has('rifle') && !canConceal(state.role, 'rifle')) {
+          state.visibleWeapon = 'rifle';
+        }
         this.broadcast({ t: 'role', id: state.id, role: state.role });
         this.sendHealth(conn, state, state.id);
         // Role reissues kit, so the client's idea of what it carries is stale.
-        this.send(conn, { t: 'inventory', weapons: state.inventoryList });
+        this.send(conn, { t: 'inventory', items: state.inventoryList });
         break;
       }
 
@@ -164,6 +189,10 @@ export class GameServer {
         // Only what is openly held. There is no message for a concealed weapon,
         // so the server is never in a position to leak one.
         state.visibleWeapon = isWeapon(msg.weapon) ? msg.weapon : null;
+        // A non-Security role cannot conceal a rifle: force it into view.
+        if (state.inventory.has('rifle') && !canConceal(state.role, 'rifle')) {
+          state.visibleWeapon = 'rifle';
+        }
         break;
       }
 
@@ -179,6 +208,7 @@ export class GameServer {
             now,
           ),
         );
+        this.broadcastNoise(state.x, state.z, 'gunshot');
         break;
       }
 
@@ -195,6 +225,7 @@ export class GameServer {
             now,
           ),
         );
+        this.broadcastNoise(state.x, state.z, 'melee');
         break;
       }
 
@@ -209,12 +240,209 @@ export class GameServer {
       }
 
       case 'drop': {
-        if (!isWeapon(msg.weapon) || !state.inventory.has(msg.weapon)) break;
-        state.inventory.delete(msg.weapon);
-        if (state.visibleWeapon === msg.weapon) state.visibleWeapon = null;
-        const item = this.items.dropInFront(msg.weapon, state.x, state.y, state.z, state.yaw);
+        if (!isItem(msg.item) || !state.inventory.has(msg.item)) break;
+        state.inventory.delete(msg.item);
+        if (isWeaponItem(msg.item) && state.visibleWeapon === msg.item) state.visibleWeapon = null;
+        const item = this.items.dropInFront(msg.item, state.x, state.y, state.z, state.yaw);
         this.broadcast({ t: 'itemAdded', item });
-        this.send(conn, { t: 'inventory', weapons: state.inventoryList });
+        this.send(conn, { t: 'inventory', items: state.inventoryList });
+        break;
+      }
+
+      case 'openContainer': {
+        if (!state.alive || typeof msg.id !== 'number') break;
+        const cdef = CONTAINERS.find((c) => c.id === msg.id);
+        if (!cdef) break;
+        const dx = state.x - cdef.x;
+        const dz = state.z - cdef.z;
+        if (Math.sqrt(dx * dx + dz * dz) > GAME_CONFIG.world.containerReach) break;
+        const found = this.containers.open(msg.id);
+        if (found === null) {
+          this.send(conn, { t: 'alert', text: 'Container already searched.' });
+          break;
+        }
+        // Spill items on the floor near the container.
+        if (found.length > 0) {
+          this.items.spill(found, cdef.x, 0, cdef.z);
+          this.broadcast({ t: 'itemsReset', items: this.items.list() });
+    this.broadcast({ t: 'patients', patients: this.patients.publicUpdates() });
+        }
+        this.send(conn, { t: 'container', id: msg.id, items: found });
+        break;
+      }
+
+      case 'use': {
+        if (!isItem(msg.item) || !state.inventory.has(msg.item) || isWeaponItem(msg.item)) break;
+        if (msg.item === 'medkit') {
+          state.inventory.delete('medkit');
+          state.health = state.maxHealth;
+          this.sendHealth(conn, state, state.id);
+          this.send(conn, { t: 'inventory', items: state.inventoryList });
+        } else if (msg.item === 'report') {
+          // Read privately. The item is NOT consumed — only broadcasting spends
+          // it, so an operator may sit on what he knows for as long as he likes.
+          const report = this.buildReport(state);
+          this.send(conn, report ?? { t: 'alert', text: 'THE REPORT NAMES NOBODY' });
+        } else if (msg.item === 'gauze' || msg.item === 'morphine') {
+          this.send(conn, { t: 'alert', text: 'Use that on a patient in the medical ward — hold [E] near a bed.' });
+        }
+        break;
+      }
+
+      case 'examine': {
+        if (!state.alive || typeof msg.patientId !== 'number') break;
+        const need = this.patients.examine(msg.patientId, state.id);
+        if (need !== null) {
+          this.send(conn, { t: 'examine', patientId: msg.patientId, need });
+        }
+        break;
+      }
+
+      case 'treat': {
+        if (!state.alive || typeof msg.patientId !== 'number') break;
+        if (!isItem(msg.item) || !state.inventory.has(msg.item)) break;
+        if (this.patients.treat(msg.patientId, msg.item)) {
+          state.inventory.delete(msg.item);
+          this.send(conn, { t: 'inventory', items: state.inventoryList });
+          this.broadcast({ t: 'patients', patients: this.patients.publicUpdates() });
+          this.send(conn, { t: 'alert', text: 'Patient stabilised.' });
+        } else {
+          this.send(conn, { t: 'alert', text: 'That is not what this patient needs.' });
+        }
+        break;
+      }
+
+      case 'startPuzzle': {
+        if (!state.alive) break;
+        const puzzle = this.telegrams.startPuzzle(state.id);
+        this.send(conn, { t: 'puzzle', id: puzzle.id, scrambled: puzzle.scrambled });
+        break;
+      }
+
+      case 'puzzleAnswer': {
+        if (!state.alive || typeof msg.word !== 'string') break;
+        const result = this.telegrams.answer(state.id, msg.word);
+        if (!result.correct) {
+          this.send(conn, { t: 'alert', text: `Incorrect — try again.` });
+          break;
+        }
+        this.send(conn, { t: 'alert', text: `Correct! (${result.totalDeciphers} deciphered)` });
+        // The intelligence arrives as a THING, not as a private message. Making
+        // it an item means it can be dropped, looted off a corpse, or taken in a
+        // search — the most valuable information in the round is physical.
+        if (result.earnedReport && !state.inventory.has('report')) {
+          state.inventory.add('report');
+          this.send(conn, { t: 'inventory', items: state.inventoryList });
+          this.send(conn, { t: 'alert', text: 'SIGNALS REPORT RECEIVED — [U] TO READ' });
+        }
+        this.sendDuty(state, null, now);
+        break;
+      }
+
+      case 'chat': {
+        if (!state.alive || typeof msg.text !== 'string') break;
+        const text = msg.text.trim().slice(0, 200);
+        if (!text) break;
+        const isBroadcast = msg.broadcast === true && state.role === 'telegram'
+          && this.telegrams.canBroadcast(state.id, now);
+        if (isBroadcast) {
+          this.telegrams.setBroadcastUsed(state.id, now);
+          this.broadcast({ t: 'chatMsg', from: state.id, name: state.name, text, channel: 'broadcast' });
+        } else {
+          const chatRadius = GAME_CONFIG.chat.proximityRadius;
+          for (const c of this.connections) {
+            if (!c.state?.alive) continue;
+            const dx = c.state.x - state.x;
+            const dz = c.state.z - state.z;
+            if (Math.sqrt(dx * dx + dz * dz) <= chatRadius) {
+              this.send(c, { t: 'chatMsg', from: state.id, name: state.name, text, channel: 'local' });
+            }
+          }
+        }
+        break;
+      }
+
+      case 'searchStart': {
+        if (typeof msg.target !== 'number') break;
+        const patrol = this.duties.get(state.id);
+        const begun = this.search.begin(
+          state,
+          msg.target,
+          patrol?.searchEnabled ?? false,
+          this.livePlayers(),
+          this.guards.world,
+          now,
+        );
+        if (typeof begun === 'string') {
+          this.send(conn, { t: 'alert', text: SEARCH_REFUSAL_TEXT[begun] });
+          break;
+        }
+        this.sendSearch(begun, 'begin');
+        break;
+      }
+
+      case 'searchRelease': {
+        const held = this.search.current;
+        if (!held || held.officer !== state.id) break;
+        const ended = this.search.end(this.livePlayers(), now);
+        if (ended) this.sendSearch(ended, 'end');
+        break;
+      }
+
+      case 'confiscate': {
+        if (!isItem(msg.item)) break;
+        const held = this.search.current;
+        if (!held || held.officer !== state.id) break;
+        const outcome = this.search.confiscate(msg.item, this.livePlayers(), this.guards.world);
+        if (!outcome) break;
+        if (outcome === 'dropped') {
+          // He already had one. It lands at his feet, where anybody can take it.
+          const dropped = this.items.dropInFront(msg.item, state.x, state.y, state.z, state.yaw);
+          this.broadcast({ t: 'itemAdded', item: dropped });
+          this.send(conn, { t: 'alert', text: `${ITEMS[msg.item].name} — DROPPED AT YOUR FEET` });
+        } else {
+          this.send(conn, { t: 'inventory', items: state.inventoryList });
+        }
+        // Refresh the officer's list. The target is told his pockets changed but
+        // never that anyone else was told anything.
+        this.sendSearch(held, 'begin');
+        if (!held.targetIsNpc) {
+          const targetConn = this.connFor(held.target);
+          if (targetConn?.state) {
+            this.send(targetConn, { t: 'inventory', items: targetConn.state.inventoryList });
+          }
+        }
+        break;
+      }
+
+      case 'broadcastReport': {
+        if (!state.alive || typeof msg.target !== 'number') break;
+        if (!state.inventory.has('report')) break;
+        const report = this.buildReport(state);
+        const candidate = report?.candidates.find((c) => c.id === msg.target);
+        if (!candidate) break;
+
+        // Spent. There is exactly one operator, so the accusation is inherently
+        // attributed — which is what makes lying with it expensive.
+        state.inventory.delete('report');
+        this.send(conn, { t: 'inventory', items: state.inventoryList });
+
+        const targetPlayer = this.livePlayers().find((p) => p.id === msg.target);
+        if (targetPlayer) {
+          targetPlayer.flagged = true;
+          // A permanent, compound-wide grudge: every guard shoots on sight. The
+          // flagged character IS the threat here, so the grudge point and the
+          // last-known point are both his own position, and the guards face the
+          // right way instead of crowding somewhere he has already left.
+          const at = { x: targetPlayer.x, z: targetPlayer.z };
+          this.guards.world.provoke(targetPlayer.id, at, 200, at);
+        } else {
+          // Guard grudges are keyed to player ids, so flagging an NPC is a label
+          // and an announcement — the humans who believe it do the rest.
+          this.guards.world.setFlagged(msg.target);
+        }
+        this.broadcast({ t: 'flagged', id: msg.target, label: candidate.label });
+        this.broadcast({ t: 'announce', text: `TELEGRAPH: ${candidate.label} IS AN INFILTRATOR` });
         break;
       }
 
@@ -231,12 +459,18 @@ export class GameServer {
         this.send(conn, { t: 'spawned', id: state.id, x: spawn.x, y: spawn.y, z: spawn.z });
         this.broadcast({ t: 'spawned', id: state.id, x: spawn.x, y: spawn.y, z: spawn.z }, conn);
         this.sendHealth(conn, state, state.id);
-        this.send(conn, { t: 'inventory', weapons: state.inventoryList });
+        this.send(conn, { t: 'inventory', items: state.inventoryList });
         break;
       }
 
       case 'ping': {
         if (typeof msg.id === 'number') this.send(conn, { t: 'pong', id: msg.id });
+        break;
+      }
+
+      case 'reset': {
+        const players = this.livePlayers();
+        if (players.length > 0) this.startRound(players, Date.now());
         break;
       }
     }
@@ -309,16 +543,20 @@ export class GameServer {
     const item = this.items.get(id);
     if (!item) return;
     if (Math.hypot(item.x - state.x, item.z - state.z) > GAME_CONFIG.items.reach) return;
-    // One of each in the prototype; there is no ammo pooling to make two useful.
-    if (state.inventory.has(item.weapon)) return;
+    // One of each in the prototype; there is no pooling to make two useful.
+    if (state.inventory.has(item.item)) return;
     // A rifle is a metre of wood and steel: only the Security Officer has any
     // business picking one up, so a dead guard's rifle is useless to a clerk.
-    if (!canCarry(state.role, item.weapon)) return;
+    if (isWeaponItem(item.item) && !canCarry(state.role, item.item)) return;
 
     this.items.remove(id);
-    state.inventory.add(item.weapon);
+    state.inventory.add(item.item);
+    // A non-Security role picking up a rifle cannot conceal it.
+    if (item.item === 'rifle' && !canConceal(state.role, 'rifle')) {
+      state.visibleWeapon = 'rifle';
+    }
     this.broadcast({ t: 'itemRemoved', id });
-    this.send(conn, { t: 'inventory', weapons: state.inventoryList });
+    this.send(conn, { t: 'inventory', items: state.inventoryList });
   }
 
   /**
@@ -334,11 +572,32 @@ export class GameServer {
     if (Math.hypot(def.x - state.x, def.z - state.z) > GAME_CONFIG.world.doorReach) return;
     this.doors.toggle(id);
     this.broadcast({ t: 'doors', open: this.doors.openIds() });
+    // Check access after toggling so the door physically opens (the surprise is
+    // the guards reacting, not a door that refuses to move).
+    if (!doorPermits(def, state.role, state.visibleWeapon, state.hqAccess)) {
+      this.guards.world.reportViolation(state.id, { x: def.x, z: def.z });
+    }
+    this.broadcastNoise(def.x, def.z, 'door');
+  }
+
+  /** Send a noise marker to every player within the weapon's hear radius. */
+  private broadcastNoise(x: number, z: number, kind: 'gunshot' | 'melee' | 'door'): void {
+    const radius = kind === 'gunshot' ? GAME_CONFIG.guards.gunshotHearRadius
+      : kind === 'melee' ? 8
+      : GAME_CONFIG.chat.proximityRadius;
+    for (const c of this.connections) {
+      if (!c.state) continue;
+      const dx = c.state.x - x;
+      const dz = c.state.z - z;
+      if (Math.sqrt(dx * dx + dz * dz) <= radius) {
+        this.send(c, { t: 'noise', x, z, kind });
+      }
+    }
   }
 
   private applyDrops(drops: CombatOutcome['drops']): void {
     for (const drop of drops) {
-      for (const item of this.items.spill(drop.weapons, drop.x, drop.y, drop.z)) {
+      for (const item of this.items.spill(drop.items, drop.x, drop.y, drop.z)) {
         this.broadcast({ t: 'itemAdded', item });
       }
     }
@@ -381,7 +640,7 @@ export class GameServer {
     for (const update of outcome.healthUpdates) {
       if (update.player.alive) continue;
       const victimConn = this.connFor(update.player.id);
-      if (victimConn) this.send(victimConn, { t: 'inventory', weapons: update.player.inventoryList });
+      if (victimConn) this.send(victimConn, { t: 'inventory', items: update.player.inventoryList });
     }
   }
 
@@ -403,7 +662,7 @@ export class GameServer {
     const players = this.livePlayers();
     if (players.length > 0) {
       const before = this.doors.openIds().length;
-      this.dispatch(null, this.guards.tick(dt, nowWall, players, this.doors));
+      this.dispatch(null, this.guards.tick(dt, nowWall, players, this.doors, this.items));
       // Guards push doors open as they walk into them; everyone has to be told.
       if (this.doors.openIds().length !== before) {
         this.broadcast({ t: 'doors', open: this.doors.openIds() });
@@ -412,7 +671,138 @@ export class GameServer {
 
     this.tickRound(players, nowWall);
     this.tickDuties(players, dt * 1000, nowWall);
+    this.tickSearch(players, nowWall);
+    this.tickPatients(dt, nowWall);
     this.broadcastSnapshot();
+  }
+
+  /**
+   * The ward, and the bridge between its two halves.
+   *
+   * A patient is one character in two systems: an `Npc` body that can be shot
+   * and a `PatientState` that can deteriorate. They share an id (see
+   * `NpcWorld.patientIds`) and this is where they are reconciled, so a patient
+   * can never be dead in one and alive in the other. The two causes of death
+   * announce differently on purpose: neglect points at the Doctor, gunfire
+   * points at whoever was in the ward with a weapon.
+   */
+  private tickPatients(dt: number, now: number): void {
+    let changed = false;
+
+    for (const patient of this.patients.all) {
+      if (patient.status === 'dead') continue;
+      if (this.guards.world.info(patient.id)?.alive !== false) continue;
+      if (this.patients.kill(patient.id, 'gunfire')) {
+        changed = true;
+        this.broadcast({ t: 'announce', text: 'A PATIENT HAS BEEN SHOT IN THE MEDICAL WARD' });
+      }
+    }
+
+    const { updates, deaths } = this.patients.tick(dt);
+    for (const id of deaths) {
+      // Nobody attacked him, so nothing here may make a guard hostile — but the
+      // body still has to lie down.
+      this.guards.world.expire(id);
+      this.broadcast({ t: 'announce', text: 'A PATIENT HAS DIED IN THE MEDICAL WARD' });
+    }
+
+    if (!changed && updates.length === 0) return;
+    this.broadcast({ t: 'patients', patients: this.patients.publicUpdates() });
+    // The Doctor's duty line is a live read of the ward rather than state of its
+    // own, so it has to be repushed whenever the ward moves.
+    if (!this.round.running) return;
+    for (const conn of this.connections) {
+      const who = conn.state;
+      if (who?.role === 'doctor') this.send(conn, { t: 'duty', duty: this.roleDutyStatus(who, now) });
+    }
+  }
+
+  // -------------------------------------------------------------------- search
+
+  /**
+   * Auto-release, and the two ways a hold can be cut short: either party dying,
+   * or the officer leaving. The decision window is generous precisely so that
+   * standing still together is a long, public, interruptible event.
+   */
+  private tickSearch(players: readonly PlayerState[], now: number): void {
+    const held = this.search.current;
+    if (held) {
+      const officer = players.find((p) => p.id === held.officer);
+      const targetGone = held.targetIsNpc
+        ? this.guards.world.info(held.target)?.alive !== true
+        : players.find((p) => p.id === held.target)?.alive !== true;
+      if (!officer?.alive || targetGone) {
+        const cut = this.search.end(players, now);
+        if (cut) this.sendSearch(cut, 'end');
+        return;
+      }
+    }
+    const released = this.search.tick(players, now);
+    if (released) this.sendSearch(released, 'end');
+  }
+
+  /**
+   * The asymmetry, in one function (CLAUDE.md §16).
+   *
+   * Everyone nearby is told THAT a search is happening, because two people
+   * standing perfectly still together is a public event and half the value of
+   * the mechanic is bystanders watching it. `items` rides on the officer's copy
+   * and no other — not even the copy addressed to the person being searched.
+   * That is what lets an officer find a pistol and say he found nothing.
+   */
+  private sendSearch(search: ActiveSearch, phase: 'begin' | 'end'): void {
+    const players = this.livePlayers();
+    const officer = players.find((p) => p.id === search.officer);
+    const radius = GAME_CONFIG.chat.proximityRadius;
+    const items = phase === 'begin'
+      ? this.search.itemsOf(search, players, this.guards.world)
+      : [];
+
+    for (const conn of this.connections) {
+      const who = conn.state;
+      if (!who) continue;
+      const involved = who.id === search.officer || who.id === search.target;
+      // An officer who has disconnected has no position to measure from; the
+      // release still has to reach the target, so it goes to everyone.
+      const near = !officer || Math.hypot(who.x - officer.x, who.z - officer.z) <= radius;
+      if (!involved && !near) continue;
+      if (who.id === search.officer && phase === 'begin') {
+        this.send(conn, { t: 'search', phase, officer: search.officer, target: search.target, items });
+      } else {
+        this.send(conn, { t: 'search', phase, officer: search.officer, target: search.target });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------- report
+
+  /**
+   * What the signals report says. Built fresh on every read so it survives a
+   * disconnect, and never cached, because the candidate list is the roster and
+   * the roster can lose people.
+   *
+   * The Security Officer is absent from the candidates: he is always a Loyalist,
+   * so accusing him could only ever be noise. Players and NPCs are mixed into
+   * one undifferentiated list — an operator who could tell which candidates were
+   * human would have broken the disguise the whole roster exists to maintain.
+   */
+  private buildReport(operator: PlayerState): Extract<ServerMessage, { t: 'report' }> | null {
+    const candidates: { id: number; label: string }[] = [];
+    for (const player of this.livePlayers()) {
+      if (player.id === operator.id || player.role === 'security') continue;
+      candidates.push({ id: player.id, label: player.label || player.name });
+    }
+    for (const npc of this.guards.world.rosterEntries) {
+      candidates.push({ id: npc.id, label: npc.label });
+    }
+    candidates.sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
+
+    const ids = new Set(candidates.map((c) => c.id));
+    const pool = this.round.infiltratorIds.filter((id) => id !== operator.id && ids.has(id));
+    if (pool.length === 0) return null;
+    // The intelligence never lies. Only the operator's broadcast can.
+    const truth = pool[Math.floor(Math.random() * pool.length)]!;
+    return { t: 'report', truth, candidates };
   }
 
   // --------------------------------------------------------------------- round
@@ -429,7 +819,15 @@ export class GameServer {
       this.startRound(players, now);
     }
 
-    const result = this.round.tick(players, this.guards.world.generalAlive, now);
+    const result = this.round.tick(
+      players,
+      {
+        generalAlive: this.guards.world.generalAlive,
+        patientsDead: this.patients.deadCount,
+        patientCauses: this.patients.deathCauses,
+      },
+      now,
+    );
     if (result) {
       // Sent to everyone, and only now: this is the one message in the protocol
       // that carries other people's allegiances, and the round is already over.
@@ -446,15 +844,31 @@ export class GameServer {
     // Everything that was true of the last round stops being true: the guards go
     // back on post, the General gets up, the floor is swept and the drawers are
     // restocked somewhere else.
-    this.guards.world.reset();
+    // The roster decides who the NPCs are, so the guards cannot be rebuilt until
+    // the round has dealt it (`round.start` above).
+    this.guards.world.reset(this.round.npcSeats);
+    this.search.reset();
+    this.duties.clear();
+    this.deliveries.clear();
     this.items.clear();
     this.seedHiddenPistols();
+    this.containers.reset();
+    this.containers.seed(['medkit', 'gauze', 'morphine', 'medkit', 'gauze', 'morphine', 'medkit', 'gauze']);
+    // One id space: the ward's patients ARE the bodies lying in it.
+    this.patients.reset(this.guards.world.patientIds);
+    this.telegrams.reset();
     this.doors.setAll([]);
     this.broadcast({ t: 'doors', open: [] });
     this.broadcast({ t: 'itemsReset', items: this.items.list() });
 
+    // Human Guards fan out one per field post; everyone else has a fixed one.
+    let guardSpawn = 0;
     for (const player of players) {
-      const spawn = this.nextSpawn();
+      const roleSpawn = player.role === 'guard'
+        ? GUARD_SPAWNS[guardSpawn++] ?? ROLE_SPAWNS.guard
+        : ROLE_SPAWNS[player.role];
+      const spawn = roleSpawn ?? this.nextSpawn();
+      player.flagged = false;
       player.revive(spawn.x, spawn.y, spawn.z, now);
       this.guards.world.forget(player.id);
       const conn = this.connFor(player.id);
@@ -463,7 +877,12 @@ export class GameServer {
       this.send(conn, { t: 'spawned', id: player.id, x: spawn.x, y: spawn.y, z: spawn.z });
       this.broadcast({ t: 'spawned', id: player.id, x: spawn.x, y: spawn.y, z: spawn.z }, conn);
       this.sendHealth(conn, player, player.id);
-      this.send(conn, { t: 'inventory', weapons: player.inventoryList });
+      this.send(conn, { t: 'inventory', items: player.inventoryList });
+      // Send role-specific duty for non-security roles. The Secretary's real
+      // line arrives a tick later, when `syncDuty` issues her the dispatch run.
+      if (player.role !== 'security') {
+        this.send(conn, { t: 'duty', duty: this.roleDutyStatus(player, now) });
+      }
     }
 
     console.log(`[round] started with ${players.length} players`);
@@ -479,38 +898,136 @@ export class GameServer {
   private tickDuties(players: readonly PlayerState[], dtMs: number, now: number): void {
     for (const player of players) {
       this.syncDuty(player, now);
-      const duty = this.duties.get(player.id);
       // A dead officer is not neglecting his patrol; he is dead. The deadline
       // still runs, which is correct — the compound does not wait for him.
-      if (!duty || !player.alive) continue;
-      if (duty.tick(player.x, player.z, now, dtMs)) this.sendDuty(player, duty, now);
+      if (!player.alive) continue;
+
+      const patrol = this.duties.get(player.id);
+      if (patrol) {
+        if (patrol.tick(player.x, player.z, now, dtMs)) this.sendDuty(player, patrol, now);
+        continue;
+      }
+
+      const delivery = this.deliveries.get(player.id);
+      if (!delivery) continue;
+      const changed = delivery.tick(
+        player.x,
+        player.z,
+        player.inventory.has('telegram'),
+        now,
+        dtMs,
+      );
+      // The ONLY punishment for missing deliveries, and it is not a score: from
+      // here the HQ door and the guards treat her exactly as they treat a
+      // doctor, and everyone can watch it happen (CLAUDE.md §32).
+      player.hqAccess = !delivery.banned;
+      if (delivery.holdComplete) {
+        this.completeDelivery(player, delivery, now);
+      } else if (changed) {
+        this.sendDuty(player, null, now);
+      }
     }
 
-    if (this.duties.size <= players.length) return;
     const live = new Set(players.map((p) => p.id));
     for (const id of [...this.duties.keys()]) if (!live.has(id)) this.duties.delete(id);
+    for (const id of [...this.deliveries.keys()]) if (!live.has(id)) this.deliveries.delete(id);
   }
 
-  /** A patrol exists for exactly as long as he is the officer and a round is on. */
-  private syncDuty(player: PlayerState, now: number): void {
-    const wants = this.round.running && player.role === 'security';
-    const has = this.duties.get(player.id);
-    if (wants === Boolean(has)) return;
+  /** One leg of the dispatch run finished: hand over or take the dispatch. */
+  private completeDelivery(player: PlayerState, duty: DeliveryDuty, now: number): void {
+    const conn = this.connFor(player.id);
+    if (duty.phase === 'collect') {
+      player.inventory.add('telegram');
+      if (conn) {
+        this.send(conn, { t: 'inventory', items: player.inventoryList });
+        this.send(conn, { t: 'alert', text: 'DISPATCH COLLECTED — TAKE IT TO THE GENERAL' });
+      }
+    } else {
+      player.inventory.delete('telegram');
+      if (conn) {
+        this.send(conn, { t: 'inventory', items: player.inventoryList });
+        this.send(conn, { t: 'alert', text: 'DISPATCH DELIVERED' });
+      }
+    }
+    duty.advance(now);
+    this.sendDuty(player, null, now);
+  }
 
-    if (wants) {
+  /**
+   * A duty exists for exactly as long as the player holds the role and a round
+   * is on. Two roles carry state (the officer's patrol, the secretary's dispatch
+   * run); the doctor's and the operator's lines are pure reads, so they need no
+   * bookkeeping here.
+   */
+  private syncDuty(player: PlayerState, now: number): void {
+    const running = this.round.running;
+    const wantsPatrol = running && player.role === 'security';
+    const wantsDelivery = running && player.role === 'secretary';
+    const hasPatrol = this.duties.has(player.id);
+    const hasDelivery = this.deliveries.has(player.id);
+    if (wantsPatrol === hasPatrol && wantsDelivery === hasDelivery) return;
+
+    if (!wantsPatrol && hasPatrol) this.duties.delete(player.id);
+    if (!wantsDelivery && hasDelivery) {
+      this.deliveries.delete(player.id);
+      // Losing the duty restores the pass; only an active, missed run revokes it.
+      player.hqAccess = true;
+    }
+
+    if (wantsPatrol && !hasPatrol) {
       const duty = new PatrolDuty();
       duty.start(now);
       this.duties.set(player.id, duty);
       this.sendDuty(player, duty, now);
-    } else {
-      this.duties.delete(player.id);
-      this.sendDuty(player, null, now);
+      return;
     }
+    if (wantsDelivery && !hasDelivery) {
+      const duty = new DeliveryDuty();
+      duty.start(now);
+      this.deliveries.set(player.id, duty);
+    }
+    this.sendDuty(player, null, now);
   }
 
   private sendDuty(player: PlayerState, duty: PatrolDuty | null, now: number): void {
     const conn = this.connFor(player.id);
-    if (conn) this.send(conn, { t: 'duty', duty: duty ? duty.status(now) : null });
+    if (!conn) return;
+    if (duty) {
+      this.send(conn, { t: 'duty', duty: duty.status(now) });
+      return;
+    }
+    // Non-security roles get a simple static duty line.
+    if (!this.round.running) {
+      this.send(conn, { t: 'duty', duty: null });
+      return;
+    }
+    this.send(conn, { t: 'duty', duty: this.roleDutyStatus(player, now) });
+  }
+
+  /**
+   * The duty line for a role that is not the officer's patrol. The doctor's and
+   * the operator's are live reads of the ward and the puzzle count rather than
+   * stored progress, so neither can be "completed" and then abandoned.
+   */
+  private roleDutyStatus(player: PlayerState, now: number): DutyStatus | null {
+    switch (player.role) {
+      case 'doctor':
+        return medicalStatus(this.patients.worst);
+      case 'secretary':
+        return this.deliveries.get(player.id)?.status(now) ?? null;
+      case 'telegram':
+        return {
+          label: 'SIGNALS DUTY',
+          detail: `DECIPHER TELEGRAMS — ${this.telegrams.deciphers(player.id)} / ${GAME_CONFIG.telegram.deciphersForIntel}`,
+          secondsLeft: 0,
+          ok: true,
+          dwell: 0,
+        };
+      case 'guard':
+        return { label: 'GUARD DUTY', detail: 'HOLD YOUR POST', secondsLeft: 0, ok: true, dwell: 0 };
+      default:
+        return null;
+    }
   }
 
   /**
@@ -565,6 +1082,10 @@ function isRole(value: unknown): value is Role {
 
 function isWeapon(value: unknown): value is WeaponId {
   return typeof value === 'string' && Object.prototype.hasOwnProperty.call(WEAPONS, value);
+}
+
+function isItem(value: unknown): value is import('../shared/inventory').ItemId {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(ITEMS, value);
 }
 
 function cleanName(raw: unknown, fallbackId: number): string {

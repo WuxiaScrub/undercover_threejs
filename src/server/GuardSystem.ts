@@ -7,6 +7,7 @@
  * events into wire messages.
  */
 import type { DoorField } from '../shared/doors';
+import type { ItemField } from '../shared/items';
 import { round } from '../shared/net';
 import { NpcWorld, type Perceivable } from '../shared/npc';
 import type { CombatOutcome } from './CombatSystem';
@@ -26,11 +27,12 @@ export class GuardSystem {
     nowMs: number,
     players: readonly PlayerState[],
     doors: DoorField,
+    items?: ItemField,
   ): CombatOutcome {
     const out: CombatOutcome = { toAll: [], toAttacker: [], healthUpdates: [], drops: [] };
 
     const people: Perceivable[] = players.map((p) => p.perceivable);
-    const events = this.world.tick(dt, nowMs, people, doors.solids(), doors);
+    const events = this.world.tick(dt, nowMs, people, doors.solids(), doors, items);
 
     for (const ev of events) {
       if (ev.t === 'shout') {
@@ -60,6 +62,13 @@ export class GuardSystem {
         continue;
       }
 
+      if (ev.t === 'took') {
+        // The item was already removed from ItemField by the guard brain; just
+        // tell all clients so they remove it from their floor views.
+        out.toAll.push({ t: 'itemRemoved', id: ev.itemId });
+        continue;
+      }
+
       const victim = players.find((p) => p.id === ev.targetId);
       if (!victim) continue;
       const killed = victim.applyDamage(ev.damage, nowMs);
@@ -72,7 +81,7 @@ export class GuardSystem {
           cause: 'rifle',
           region: ev.region,
         });
-        out.drops.push({ weapons: victim.inventoryList, x: victim.x, y: victim.y, z: victim.z });
+        out.drops.push({ items: victim.inventoryList, x: victim.x, y: victim.y, z: victim.z });
         victim.inventory.clear();
         victim.visibleWeapon = null;
       }

@@ -335,6 +335,53 @@
         font-size: 13px;
         color: #cdc7b6;
       }
+      /* Inventory panel — I or Tab, pointer lock kept. */
+      #inventory {
+        position: fixed;
+        right: 24px;
+        top: 50%;
+        transform: translateY(-50%);
+        min-width: 200px;
+        background: rgba(10, 12, 10, 0.82);
+        border: 1px solid rgba(232, 228, 216, 0.22);
+        padding: 10px 14px;
+        display: none;
+        flex-direction: column;
+        gap: 4px;
+        z-index: 6;
+        pointer-events: none;
+      }
+      #inventory.show {
+        display: flex;
+      }
+      #inventory-title {
+        font-size: 10px;
+        letter-spacing: 3px;
+        color: #8f8c80;
+        margin-bottom: 4px;
+      }
+      .inv-row {
+        font-size: 12px;
+        letter-spacing: 1px;
+        color: #cdc7b6;
+        padding: 2px 0;
+      }
+      .inv-row.selected {
+        color: #f0e9d2;
+        border-left: 2px solid #d8c46a;
+        padding-left: 6px;
+      }
+      .inv-empty {
+        font-size: 11px;
+        color: #5a5850;
+        letter-spacing: 2px;
+      }
+      #inventory-hint {
+        margin-top: 6px;
+        font-size: 10px;
+        color: #5a5850;
+        letter-spacing: 1px;
+      }
       #net-panel {
         display: flex;
         flex-direction: column;
@@ -345,6 +392,157 @@
         border: 1px solid rgba(232, 228, 216, 0.18);
         background: rgba(0, 0, 0, 0.3);
         cursor: default;
+      }
+      /* Proximity chat */
+      #chat {
+        position: fixed;
+        left: 24px;
+        bottom: 24px;
+        width: 320px;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        z-index: 6;
+        pointer-events: none;
+      }
+      /*
+       * Proximity chat is switched off for this build (plan M6) — the nodes stay
+       * so HUD's constructor still finds them and turning it back on is one
+       * line of CSS.
+       */
+      #chat-log {
+        display: none;
+        max-height: 120px;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column-reverse;
+        gap: 2px;
+      }
+      .chat-line {
+        font-size: 11px;
+        letter-spacing: 0.5px;
+        color: #cdc7b6;
+        text-shadow: 0 1px 2px #000;
+        opacity: 1;
+        transition: opacity 0.5s;
+        white-space: pre-wrap;
+      }
+      .chat-line.broadcast { color: #d8c46a; }
+      .chat-line.fading { opacity: 0; }
+      #chat-input-row {
+        display: none;
+        gap: 4px;
+        align-items: center;
+      }
+      #chat-input-row.show { display: flex; }
+      #chat-prompt-label {
+        font-size: 11px;
+        color: #8f8c80;
+      }
+      #chat-input-text {
+        flex: 1;
+        font-size: 11px;
+        font-family: inherit;
+        color: #f0e9d2;
+        background: rgba(10,10,14,0.7);
+        border: 1px solid rgba(232,228,216,0.3);
+        padding: 3px 6px;
+      }
+      /* Signals report — the Telegram Operator's intelligence, read in place.
+         Built like #inventory: pointer lock is never released, so reading it in
+         a corridor is exactly as dangerous as it sounds. */
+      #report {
+        position: fixed;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        min-width: 300px;
+        max-height: 70vh;
+        overflow: hidden;
+        background: rgba(10, 12, 10, 0.9);
+        border: 1px solid rgba(232, 228, 216, 0.28);
+        padding: 14px 18px;
+        display: none;
+        flex-direction: column;
+        gap: 4px;
+        z-index: 7;
+        pointer-events: none;
+      }
+      #report.show { display: flex; }
+      #report-title {
+        font-size: 10px;
+        letter-spacing: 3px;
+        color: #8f8c80;
+      }
+      #report-truth {
+        font-size: 13px;
+        letter-spacing: 1px;
+        color: #d8c46a;
+        margin: 6px 0 10px;
+      }
+      #report-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .report-row {
+        font-size: 12px;
+        letter-spacing: 1px;
+        color: #cdc7b6;
+      }
+      #report-hint {
+        margin-top: 10px;
+        font-size: 10px;
+        color: #5a5850;
+        letter-spacing: 1px;
+      }
+      /* Minimap */
+      #minimap-wrap {
+        position: fixed;
+        right: 24px;
+        bottom: 24px;
+        width: 140px;
+        height: 140px;
+        border-radius: 50%;
+        overflow: hidden;
+        border: 1px solid rgba(232,228,216,0.25);
+        z-index: 5;
+        pointer-events: none;
+      }
+      #minimap { display: block; }
+      /* Container / search progress bar */
+      #search-progress {
+        position: fixed;
+        left: 50%;
+        top: 60%;
+        transform: translateX(-50%);
+        width: 180px;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+        pointer-events: none;
+        z-index: 6;
+      }
+      #search-progress.show { display: flex; }
+      #search-label {
+        font-size: 10px;
+        letter-spacing: 2px;
+        color: #cdc7b6;
+        text-shadow: 0 1px 2px #000;
+      }
+      #search-bar {
+        width: 100%;
+        height: 4px;
+        background: rgba(0,0,0,0.5);
+        border: 1px solid rgba(232,228,216,0.3);
+        overflow: hidden;
+      }
+      #search-bar-fill {
+        height: 100%;
+        width: 0%;
+        background: #d8c46a;
+        transition: width 0.05s linear;
       }
       #net-panel .row {
         display: flex;
@@ -426,6 +624,31 @@
       <div id="hud-weapon">UNARMED</div>
       <div id="hud-kit">CARRYING NOTHING</div>
     </div>
+    <div id="inventory">
+      <div id="inventory-title">INVENTORY</div>
+      <div id="inventory-list"></div>
+      <div id="inventory-hint">[U] use  ·  [G] drop  ·  [I] close</div>
+    </div>
+    <div id="chat">
+      <div id="chat-log"></div>
+      <div id="chat-input-row">
+        <span id="chat-prompt-label">~</span>
+        <span id="chat-input-text"></span>
+      </div>
+    </div>
+    <div id="report">
+      <div id="report-title">SIGNALS INTELLIGENCE</div>
+      <div id="report-truth"></div>
+      <div id="report-list"></div>
+      <div id="report-hint">[1-9] broadcast a name  ·  [ESC] close and keep the report</div>
+    </div>
+    <div id="search-progress">
+      <div id="search-label">SEARCHING…</div>
+      <div id="search-bar"><div id="search-bar-fill"></div></div>
+    </div>
+    <div id="minimap-wrap">
+      <canvas id="minimap" width="140" height="140"></canvas>
+    </div>
     <div id="overlay">
       <h1>MILITARY COMPOUND</h1>
       <p>
@@ -434,7 +657,7 @@
         LMB shoot / strike &nbsp;·&nbsp; RMB draw / put away &nbsp;·&nbsp; SCROLL switch weapon<br />
         E use / doors &nbsp;·&nbsp; G discard &nbsp;·&nbsp; R reload<br />
         F1 collision &nbsp;·&nbsp; F2 hitboxes &nbsp;·&nbsp; F3 guard vision &nbsp;·&nbsp; F4 faction
-        &nbsp;·&nbsp; F5 role &nbsp;·&nbsp; F6/F7 arm &nbsp;·&nbsp; F8 reset &nbsp;·&nbsp; F9
+        &nbsp;·&nbsp; F5 role &nbsp;·&nbsp; F6/F7 arm &nbsp;·&nbsp; F8 reset round &nbsp;·&nbsp; F9
         unstick<br />
         B spawn target &nbsp;·&nbsp; N target role &nbsp;·&nbsp; V target weapon &nbsp;·&nbsp; M clear
         targets &nbsp;·&nbsp; ESC release mouse

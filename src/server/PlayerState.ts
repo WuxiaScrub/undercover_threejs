@@ -3,6 +3,7 @@ import { NET_CONFIG, round, type PlayerPublic, type PlayerSnapshot } from '../sh
 import { ROLE_STATS, type Role } from '../shared/roles';
 import type { CombatTarget } from '../shared/combat';
 import type { Perceivable } from '../shared/npc';
+import type { ItemId } from '../shared/inventory';
 import { startingWeapons, type WeaponId } from '../shared/weapons';
 
 /** How far outside the compound a position may sit before it is nonsense. */
@@ -47,10 +48,32 @@ export class PlayerState {
    * secret a Security Officer's search exists to uncover — it is sent to its
    * owner and to nobody else.
    */
-  readonly inventory = new Set<WeaponId>();
+  readonly inventory = new Set<ItemId>();
   diedAtMs = 0;
   lastFireMs = 0;
   lastMeleeMs = 0;
+
+  /**
+   * This round's public roster label — `GUARD 3`, `DOCTOR`. It is what every
+   * other client is told this player is called; the name they typed never leaves
+   * the server (CLAUDE.md §30). Empty until a round deals one.
+   */
+  label = '';
+
+  /**
+   * Server-clock ms before which this player cannot be searched again. A search
+   * has to cost the officer something or he simply searches everyone in a line,
+   * and the immunity window is what buys the searched player time to act on
+   * whatever the officer just did or did not say.
+   */
+  searchableAtMs = 0;
+
+  /**
+   * Whether HQ will let this player through. False only for a secretary who has
+   * missed her deliveries: the restricted-zone check and the HQ door both read
+   * it, so a banned secretary is challenged at HQ exactly like a doctor is.
+   */
+  hqAccess = true;
 
   private lastUpdateMs: number;
 
@@ -72,7 +95,7 @@ export class PlayerState {
     return ROLE_STATS[this.role].maxHealth;
   }
 
-  get inventoryList(): WeaponId[] {
+  get inventoryList(): ItemId[] {
     return [...this.inventory];
   }
 
@@ -87,11 +110,17 @@ export class PlayerState {
       role: this.role,
       alive: this.alive,
       weapon: this.visibleWeapon,
+      hqAccess: this.hqAccess,
     };
   }
 
+  /**
+   * What everyone else is told about this player. `name` deliberately carries
+   * the roster LABEL — see the field — so that no client ever holds a mapping
+   * from a character to a person.
+   */
   get info(): PlayerPublic {
-    return { id: this.id, name: this.name, role: this.role };
+    return { id: this.id, name: this.label || this.name, role: this.role };
   }
 
   /** The shootable view of this player, for shared/combat.ts. */
@@ -110,8 +139,12 @@ export class PlayerState {
       sprinting: this.sprinting,
       alive: this.alive,
       weapon: this.visibleWeapon,
+      ...(this.flagged ? { flagged: true } : {}),
     };
   }
+
+  /** Denounced by the Telegram Operator's broadcast; set for the rest of the round. */
+  flagged = false;
 
   /** Dev role cycling changes max health, so the current value has to follow. */
   setRole(role: Role): void {

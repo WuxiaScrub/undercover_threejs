@@ -49,6 +49,7 @@ export class CharacterMesh {
   private readonly weaponSlots: Record<WeaponId, THREE.Group>;
   private readonly weaponAnims = new Map<WeaponId, THREE.AnimationAction>();
   private equipped: WeaponId | null = null;
+  private lastEquipped: WeaponId | null = null;
   private walkPhase = 0;
   private swingTimer = 0;
   private aiming = false;
@@ -261,6 +262,9 @@ export class CharacterMesh {
    */
   setWeapon(weapon: WeaponId | null): void {
     this.equipped = weapon;
+    if (weapon !== null) this.lastEquipped = weapon;
+    // Never show a weapon on a corpse — a death drop already put it on the floor.
+    if (this.dead) return;
     for (const id of Object.keys(this.weaponSlots) as WeaponId[]) {
       this.weaponSlots[id].visible = weapon === id;
     }
@@ -296,10 +300,17 @@ export class CharacterMesh {
 
     // A rigged body falls through the death clip, which is the whole reason the
     // hips' vertical track survives the strip in CharacterAssets. Rifle carriers
-    // get the version that keeps hold of the weapon.
-    this.clipDeath = this.playOneShot(this.equipped === 'rifle' ? 'rifle_death' : 'death', {
+    // get the version that keeps hold of the weapon. Use lastEquipped so a remote
+    // player whose weapon was cleared just before setDead still plays rifle_death.
+    const heldAtDeath = this.equipped ?? this.lastEquipped;
+    this.clipDeath = this.playOneShot(heldAtDeath === 'rifle' ? 'rifle_death' : 'death', {
       hold: true,
     });
+
+    // Hide every weapon slot — the dropped item on the floor is the one copy.
+    for (const id of Object.keys(this.weaponSlots) as WeaponId[]) {
+      this.weaponSlots[id].visible = false;
+    }
 
     // Puddle stays flat in world space. For clip-driven death the group stays
     // upright (animation moves the model), so the puddle's local -90° is enough.

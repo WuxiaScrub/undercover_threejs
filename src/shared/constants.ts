@@ -82,6 +82,10 @@ export const GAME_CONFIG = {
      * and it is what keeps doors out of the nav grid entirely — see doors.ts.
      */
     guardDoorOpenRadius: 1.3,
+    /** How close a player must be to search a container with [E]. */
+    containerReach: 2.0,
+    /** How long the hold interaction takes. */
+    containerSearchSeconds: 3,
   },
 
   combat: {
@@ -170,6 +174,8 @@ export const GAME_CONFIG = {
      */
     provokeRadiusOnKill: 60, // m
     provokeRadiusOnHit: 25, // m
+    /** All guards within this radius respond to a door access violation. */
+    doorViolationRadius: 25, // m
 
     /**
      * Hearing (CLAUDE.md §17 — guards enforce obvious rules, and a gunshot is
@@ -232,6 +238,14 @@ export const GAME_CONFIG = {
      */
     stuckRepathAfter: 0.6, // s
     stuckGiveUpAfter: 2.5, // s
+    /**
+     * A calm guard will walk over to a dropped weapon if it is within this
+     * distance AND in his view cone (plan §6). Outside this or behind a wall,
+     * he ignores it — the weapon is not visible to him.
+     */
+    itemSightRadius: 8, // m
+    /** Seconds he will keep pursuing a dropped item before giving up. */
+    itemRetrieveDeadline: 12, // s
   },
 
   /**
@@ -283,6 +297,19 @@ export const GAME_CONFIG = {
     patrolJitterSeconds: 30,
     /** Seconds he must stand inside the checkpoint box for it to count. */
     patrolDwellSeconds: 3,
+    /** Seconds the secretary has to complete one leg of a delivery. */
+    deliverySeconds: 120,
+    /**
+     * Missed deliveries before HQ access is revoked for the rest of the round.
+     * Two, not one: the first miss has to be survivable or the duty is a trap
+     * rather than a pressure, and the second is a decision the player watched
+     * themselves make.
+     */
+    deliveryMissesBeforeBan: 2,
+    /** Seconds of holding E to collect or hand over a dispatch. */
+    deliveryHoldSeconds: 2,
+    /** How close the secretary must be to the desk to hand a dispatch over. */
+    deliveryReach: 3,
   },
   round: {
     /** How long a round runs before the loyalists win by having survived it. */
@@ -290,10 +317,11 @@ export const GAME_CONFIG = {
     /** Players needed before a round can start at all. */
     minPlayers: 2,
     /**
-     * One infiltrator per this many players, rounded up: 4 players → 1,
-     * 6 players → 2. Fewer would make a big lobby unwinnable for them.
+     * Ward patients who have to die before the compound is judged to have lost
+     * the medical ward. Both of them — losing one is a bad day for the doctor,
+     * losing both is the ward gone.
      */
-    infiltratorsPerPlayers: 4,
+    patientsLostToLose: 2,
     /** Seconds the result banner stays up before the next round can start. */
     intermissionSeconds: 20,
     /**
@@ -309,9 +337,50 @@ export const GAME_CONFIG = {
     permanentDeath: true,
   },
 
+  /** Blood-spurt particle burst when a corpse is shot (Effects.ts). */
+  bloodSpurt: {
+    poolSize: 32,
+    particlesPerBurst: 8,
+    speed: 4.5, // m/s initial velocity
+    spread: 0.6, // cone half-angle in radians
+    gravity: 9.0, // m/s^2 pulling particles down
+    lifetime: 0.35, // s
+  },
+
   // Not implemented yet (milestone 5), but the tuning value lives here from the
   // start so balance stays in one place.
   chat: {
     proximityRadius: 12, // m
+    broadcastCooldownSeconds: 45,
+  },
+
+  minimap: {
+    rangeMeters: 30,
+  },
+
+  search: {
+    reach: 2,
+    immunitySeconds: 60,
+    decisionSeconds: 15,
+  },
+
+  telegram: {
+    npcIntervalSeconds: 60,
+    deciphersForIntel: 3,
+  },
+
+  medical: {
+    woundedSeconds: 150,
+    criticalSeconds: 75,
+    examineSeconds: 1.5,
+    treatSeconds: 2.5,
+    /**
+     * How long a treated patient stays stable before deteriorating again. The
+     * ward is a loop, not a checklist: the doctor is never finished, so being
+     * somewhere else for two minutes always costs something.
+     */
+    stableSeconds: 60,
+    /** Patients start wounded on staggered clocks, +/- this many seconds. */
+    startJitterSeconds: 45,
   },
 } as const;

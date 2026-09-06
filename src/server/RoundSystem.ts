@@ -18,14 +18,29 @@
  * in a sandbox.
  */
 import { GAME_CONFIG } from '../shared/constants';
-import { infiltratorCount, type Faction } from '../shared/factions';
+import type { Faction } from '../shared/factions';
 import type { RoundPhase, ServerMessage } from '../shared/net';
-import { ROLE_ORDER, type Role } from '../shared/roles';
+import { shuffle } from '../shared/rng';
+import { ROLE_STATS, type Role } from '../shared/roles';
+import { buildRoster, infiltratorsFor, labelRoster } from '../shared/roster';
 import type { PlayerState } from './PlayerState';
 
 const cfg = GAME_CONFIG.round;
 
 export type RoundResult = { winner: Faction; reason: string };
+
+/**
+ * What the round needs to know about the compound to decide whether it is over.
+ * Passed as an object rather than a growing list of booleans because the loss
+ * conditions are about to be several and none of them belong to this class.
+ */
+export type WorldStatus = {
+  generalAlive: boolean;
+  /** Ward patients who have died, however they died. */
+  patientsDead: number;
+  /** Why they died, for the reason line. */
+  patientCauses: readonly ('neglect' | 'gunfire')[];
+};
 
 export class RoundSystem {
   phase: RoundPhase = 'lobby';
@@ -34,6 +49,13 @@ export class RoundSystem {
 
   private readonly factions = new Map<number, Faction>();
   private result: RoundResult | null = null;
+
+  /**
+   * The NPC half of this round's roster, already labelled, for
+   * `NpcWorld.reset()`. Humans and NPCs are dealt from ONE list, so the compound
+   * cannot be populated until the round has decided who the humans are.
+   */
+  npcSeats: readonly { role: Role; label: string }[] = [];
 
   get running(): boolean {
     return this.phase === 'active';
@@ -63,19 +85,45 @@ export class RoundSystem {
     this.phase = 'active';
     this.endsAtMs = now + cfg.durationSeconds * 1000;
 
-    const shuffled = [...players].sort(() => Math.random() - 0.5);
-    for (let i = 0; i < shuffled.length; i++) {
-      shuffled[i].setRole(dealRole(i, shuffled.length));
-    }
+    // ONE roster covers humans and NPCs (shared/roster.ts). Labels are computed
+    // across the whole thing before it is split, which is what makes `GUARD 3`
+    // mean the same character to everybody while giving no clue whether there is
+    // a person behind it.
+    const roster = buildRoster(players.length);
+    const all = [...roster.human, ...roster.npc];
+    const labels = labelRoster(all, (r) => ROLE_STATS[r].name);
 
-    // Deal allegiance on a second, independent shuffle. Dealing both in one pass
-    // would tie them together — the officer would always be a loyalist — and the
-    // entire game is that you cannot tell from the uniform (CLAUDE.md §2).
-    const forFaction = [...players].sort(() => Math.random() - 0.5);
-    const spies = infiltratorCount(forFaction.length, cfg.infiltratorsPerPlayers);
-    for (let i = 0; i < forFaction.length; i++) {
-      this.factions.set(forFaction[i].id, i < spies ? 'infiltrator' : 'loyalist');
+    const shuffled = shuffle([...players]);
+    for (let i = 0; i < shuffled.length; i++) {
+      shuffled[i]!.setRole(roster.human[i]!);
+      shuffled[i]!.label = labels[i]!;
+      shuffled[i]!.hqAccess = true;
+      shuffled[i]!.searchableAtMs = 0;
     }
+    this.npcSeats = roster.npc.map((role, i) => ({
+      role,
+      label: labels[roster.human.length + i]!,
+    }));
+
+    // The Security Officer is the ONE fixed point everybody is allowed to know:
+    // always human, always a loyalist. Without that his search ability is
+    // worthless — an infiltrator officer would simply search nobody — and the
+    // report would have no one it could safely leave off its candidate list.
+    // Every other role is dealt allegiance blind, so the uniform still tells you
+    // nothing (CLAUDE.md §2).
+    const officer = shuffled[0];
+    if (officer) this.factions.set(officer.id, 'loyalist');
+
+    const rest = shuffle(shuffled.slice(1));
+    const spies = Math.min(rest.length, infiltratorsFor(players.length));
+    for (let i = 0; i < rest.length; i++) {
+      this.factions.set(rest[i]!.id, i < spies ? 'infiltrator' : 'loyalist');
+    }
+  }
+
+  /** Ids of this round's infiltrators, for the Telegram Operator's report. */
+  get infiltratorIds(): number[] {
+    return [...this.factions].filter(([, f]) => f === 'infiltrator').map(([id]) => id);
   }
 
   /**
@@ -85,7 +133,7 @@ export class RoundSystem {
    *
    * @returns the result on the tick it is decided, and null on every other tick.
    */
-  tick(players: readonly PlayerState[], generalAlive: boolean, now: number): RoundResult | null {
+  tick(players: readonly PlayerState[], world: WorldStatus, now: number): RoundResult | null {
     if (this.phase !== 'active') {
       // The result banner times out back into the lobby on its own.
       if (this.phase === 'over' && now >= this.endsAtMs) {
@@ -95,7 +143,14 @@ export class RoundSystem {
       return null;
     }
 
-    if (!generalAlive) return this.finish('infiltrator', 'The General is dead.', now);
+    if (!world.generalAlive) return this.finish('infiltrator', 'The General is dead.', now);
+
+    // The ward is the second thing the compound can lose. A doctor who never
+    // treats anybody and an infiltrator who shoots the beds arrive at the same
+    // place, which is exactly the ambiguity the role exists to create.
+    if (world.patientsDead >= cfg.patientsLostToLose) {
+      return this.finish('infiltrator', patientLossReason(world.patientCauses), now);
+    }
 
     const spies = players.filter((p) => this.factions.get(p.id) === 'infiltrator');
     if (spies.length > 0 && spies.every((p) => !p.alive)) {
@@ -117,7 +172,7 @@ export class RoundSystem {
       reason: this.result?.reason ?? '',
       reveal: players.map((p) => ({
         id: p.id,
-        name: p.name,
+        name: p.label || p.name,
         role: p.role,
         faction: this.factions.get(p.id) ?? 'loyalist',
       })),
@@ -148,13 +203,13 @@ export class RoundSystem {
   }
 }
 
-/**
- * At most one Security Officer — he is the only armed role and two of them turn
- * every round into a firefight — and the rest spread evenly over the others so a
- * six-player lobby is not four secretaries.
- */
-function dealRole(index: number, total: number): Role {
-  if (index === 0 && total >= GAME_CONFIG.round.minPlayers) return 'security';
-  const rest = ROLE_ORDER.filter((r) => r !== 'security');
-  return rest[(index - 1 + rest.length) % rest.length];
+/** Names the way the ward was lost, because how it happened is the accusation. */
+function patientLossReason(causes: readonly ('neglect' | 'gunfire')[]): string {
+  if (causes.length > 0 && causes.every((c) => c === 'neglect')) {
+    return 'The patients died untreated in the medical ward.';
+  }
+  if (causes.length > 0 && causes.every((c) => c === 'gunfire')) {
+    return 'The patients were shot in the medical ward.';
+  }
+  return 'The medical ward was lost.';
 }

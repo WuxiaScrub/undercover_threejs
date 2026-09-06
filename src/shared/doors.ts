@@ -23,7 +23,9 @@
  */
 import { GAME_CONFIG } from './constants';
 import { COMPOUND } from './mapData';
+import type { Role } from './roles';
 import type { Collider } from './types';
+import type { WeaponId } from './weapons';
 
 const { wallHeight, wallThickness, doorWidth, doorReach } = GAME_CONFIG.world;
 
@@ -45,7 +47,42 @@ export type DoorDef = {
   axis: 'x' | 'z';
   width: number;
   swing: 1 | -1;
+  /**
+   * Guards on patrol will NOT push this door open. A guard in an alert state
+   * (investigating / suspicious / warning / hostile) still may, so nobody is
+   * stranded chasing an intruder. Only DOORS[0] (General's HQ) uses this.
+   */
+  restricted?: true;
+  /**
+   * Roles explicitly permitted to open this door. Any role not in this list
+   * triggers an immediate guard response via `reportViolation`. Omit to allow
+   * everyone (no access check).
+   */
+  allow?: readonly Role[];
+  /**
+   * Even permitted roles must have NO visible weapon to open without consequence.
+   * A Secretary with a drawn pistol is as suspicious as an uninvited guest.
+   */
+  noWeapons?: true;
 };
+
+/**
+ * Whether `role` with `visibleWeapon` is permitted to open `def` without
+ * triggering guards. Always true for doors without an `allow` list.
+ */
+export function doorPermits(
+  def: DoorDef,
+  role: Role,
+  visibleWeapon: WeaponId | null,
+  hqAccess = true,
+): boolean {
+  if (!def.allow) return true;
+  if (!def.allow.includes(role)) return false;
+  // A secretary who has missed her deliveries keeps the role and loses the pass.
+  if (!hqAccess) return false;
+  if (def.noWeapons && visibleWeapon !== null) return false;
+  return true;
+}
 
 const t = wallThickness / 2;
 
@@ -56,7 +93,18 @@ const t = wallThickness / 2;
  */
 export const DOORS: readonly DoorDef[] = [
   // HQ south wall, z=-12, gap at x=0. The only way into the General's office.
-  { id: 0, label: "General's HQ", x: 0, z: -12, axis: 'x', width: doorWidth, swing: 1 },
+  {
+    id: 0,
+    label: "General's HQ",
+    x: 0,
+    z: -12,
+    axis: 'x',
+    width: doorWidth,
+    swing: 1,
+    restricted: true,
+    allow: ['secretary'] as const,
+    noWeapons: true,
+  },
   // West corridor inner wall, x=-14.
   { id: 1, label: 'Admin Office', x: -14, z: -7, axis: 'z', width: doorWidth, swing: 1 },
   { id: 2, label: 'Telegram Room', x: -14, z: 7, axis: 'z', width: doorWidth, swing: 1 },
@@ -133,11 +181,16 @@ export class DoorField {
    * Push open every shut door within `radius`. This is how guards get through
    * the compound without the nav grid ever having to know a door exists — see
    * the note at the top of this file. Returns the ids that changed.
+   *
+   * `force` bypasses the `restricted` flag: a patrolling guard walking past the
+   * HQ entrance never touches it, but an alerted one chasing someone through it
+   * still can. Callers that don't pass guards pass force=false by default.
    */
-  openNear(x: number, z: number, radius: number): number[] {
+  openNear(x: number, z: number, radius: number, force = false): number[] {
     let changed: number[] | null = null;
     for (const def of DOORS) {
       if (this.open.has(def.id)) continue;
+      if (def.restricted && !force) continue;
       if (Math.hypot(def.x - x, def.z - z) > radius) continue;
       this.open.add(def.id);
       (changed ??= []).push(def.id);

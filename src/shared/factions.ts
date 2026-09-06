@@ -19,12 +19,6 @@ export const FACTION_NAME: Record<Faction, string> = {
   infiltrator: 'INFILTRATOR',
 };
 
-/**
- * How many infiltrators a lobby of `n` gets: one per `perPlayers`, rounded up,
- * so a 4-player game has one and a 6-player game has two. At least one, always
- * — a round with no infiltrator is a round the loyalists cannot lose.
- */
-export function infiltratorCount(n: number, perPlayers: number): number {
-  if (n <= 0) return 0;
-  return Math.max(1, Math.ceil(n / perPlayers));
-}
+// How many infiltrators a lobby gets is no longer a ratio — see
+// `infiltratorsFor` in shared/roster.ts, which is a table, because at 2-4
+// humans every extra infiltrator changes the game completely.

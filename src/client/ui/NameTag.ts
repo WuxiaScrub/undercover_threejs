@@ -6,8 +6,18 @@ const WORLD_WIDTH = 1.9;
 const WORLD_HEIGHT = WORLD_WIDTH * (CANVAS_HEIGHT / CANVAS_WIDTH);
 
 /**
- * Floating label over a character: name and PUBLIC role (CLAUDE.md §30).
- * Faction is never rendered here — it is never even sent to other clients.
+ * Floating label over a character: the PUBLIC role label and nothing else
+ * (CLAUDE.md §30).
+ *
+ * There is deliberately no username here, for players or NPCs. A tag reading
+ * `GUARD 3` is the entire public identity of that character, which is what makes
+ * a human indistinguishable from a routine — the moment a tag carried a name,
+ * every NPC in the compound would be identifiable by not having one. Faction is
+ * never rendered and never even sent to other clients.
+ *
+ * The second line is reserved for the few states everyone is entitled to know:
+ * `DEAD`, `*FLAGGED*`, `SEARCHING`. Guard AI modes are NOT among them — printing
+ * `SUSPICIOUS` over a guard's head was an instant NPC giveaway.
  *
  * depthTest stays on, so a label is hidden by the wall its owner is standing
  * behind. A tag visible through geometry would be a free wallhack in a game
@@ -35,7 +45,11 @@ export class NameTag {
     this.sprite.position.y = height;
   }
 
-  setText(name: string, role: string): void {
+  /**
+   * @param label the character's public roster label, e.g. `GUARD 3`.
+   * @param note  one of the few public states, or '' for the usual case.
+   */
+  setText(label: string, note = ''): void {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
@@ -44,15 +58,22 @@ export class NameTag {
     ctx.font = 'bold 34px ui-monospace, Consolas, monospace';
     ctx.lineWidth = 6;
     ctx.strokeStyle = 'rgba(0, 0, 0, 0.85)';
-    ctx.strokeText(name, CANVAS_WIDTH / 2, 32);
+    // With no second line the label sits centred, so a normal tag is one word
+    // over one head rather than a word with a gap under it.
+    const y = note ? 32 : CANVAS_HEIGHT / 2;
+    ctx.strokeText(label, CANVAS_WIDTH / 2, y);
     ctx.fillStyle = '#f2eee0';
-    ctx.fillText(name, CANVAS_WIDTH / 2, 32);
+    ctx.fillText(label, CANVAS_WIDTH / 2, y);
 
-    ctx.font = '24px ui-monospace, Consolas, monospace';
-    ctx.lineWidth = 5;
-    ctx.strokeText(role.toUpperCase(), CANVAS_WIDTH / 2, 70);
-    ctx.fillStyle = '#a9b39a';
-    ctx.fillText(role.toUpperCase(), CANVAS_WIDTH / 2, 70);
+    if (note) {
+      const upper = note.toUpperCase();
+      ctx.font = '24px ui-monospace, Consolas, monospace';
+      ctx.lineWidth = 5;
+      ctx.strokeText(upper, CANVAS_WIDTH / 2, 70);
+      // A denunciation has to be unmissable across a courtyard; DEAD does not.
+      ctx.fillStyle = upper.includes('FLAGGED') ? '#e05b4a' : '#a9b39a';
+      ctx.fillText(upper, CANVAS_WIDTH / 2, 70);
+    }
 
     this.texture.needsUpdate = true;
   }

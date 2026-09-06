@@ -360,22 +360,32 @@ export type GuardPost = {
   route: readonly { x: number; z: number }[];
   /** Facing to return to when standing a static post. */
   yaw?: number;
+  /** Unarmed orderlies shout for help rather than shooting. */
+  unarmed?: true;
+  /**
+   * A post immediately around the General's HQ. These are NPC-only: a human
+   * Guard who could start the round inside the one room that matters would make
+   * the assassination a formality, so `ROLE_SPAWNS.guard` and the roster both
+   * skip anything flagged here.
+   */
+  hq?: true;
 };
 
 export const GUARD_POSTS: readonly GuardPost[] = [
   // Two sentries OUTSIDE the HQ door, in the corridor, facing south down it —
   // they see you coming long before you reach the handle. This is the pair that
   // enforces the hq_approach zone.
-  { label: 'door sentry W', route: [{ x: -2, z: -10.2 }], yaw: Math.PI },
-  { label: 'door sentry E', route: [{ x: 2, z: -10.2 }], yaw: Math.PI },
+  { label: 'door sentry W', route: [{ x: -2, z: -10.2 }], yaw: Math.PI, hq: true },
+  { label: 'door sentry E', route: [{ x: 2, z: -10.2 }], yaw: Math.PI, hq: true },
 
   // One inside, off to the side, watching the door from within the room. If you
   // do get through, he is already looking at it.
-  { label: 'HQ sentry', route: [{ x: 3.5, z: -18.5 }], yaw: Math.atan2(3.5, -6.5) },
+  { label: 'HQ sentry', route: [{ x: 3.5, z: -18.5 }], yaw: Math.atan2(3.5, -6.5), hq: true },
 
   // A circuit of the General's office itself.
   {
     label: 'HQ patrol',
+    hq: true,
     route: [
       { x: -9, z: -15 },
       { x: -9, z: -20 },
@@ -432,6 +442,104 @@ export const GUARD_POSTS: readonly GuardPost[] = [
       { x: 0, z: 15 },
     ],
   },
+
+  // The southern half: security office, storage, and the hall between them.
+  // Nobody was watching down here, which made Storage the obvious place to meet
+  // — it should cost something to be seen there.
+  {
+    label: 'south circuit',
+    route: [
+      { x: -7, z: 26 },
+      { x: -7, z: 21 },
+      { x: 0, z: 18 },
+      { x: 7, z: 21 },
+      { x: 7, z: 26 },
+      { x: 7, z: 21 },
+      { x: 0, z: 18 },
+      { x: -7, z: 21 },
+    ],
+  },
+
+  // A short loop of the central hall itself, crossing both the north and south
+  // corridor mouths — the busiest junction in the compound.
+  {
+    label: 'hall circuit',
+    route: [
+      { x: 0, z: 13 },
+      { x: -11, z: 15 },
+      { x: -13, z: 20 },
+      { x: 11, z: 20 },
+      { x: 11, z: 15 },
+    ],
+  },
+
+  // A static pair covering the two room bands, so a full roster of eight guards
+  // still has distinct places to be rather than doubling up on a circuit.
+  { label: 'ward post', route: [{ x: 9.5, z: 5 }], yaw: Math.PI / 2 },
+  { label: 'signals post', route: [{ x: -8.5, z: 5 }], yaw: -Math.PI / 2 },
+];
+
+/** Posts a human Guard may be assigned. HQ posts are NPC-only. */
+export const FIELD_GUARD_POSTS: readonly GuardPost[] = GUARD_POSTS.filter((p) => !p.hq);
+
+/**
+ * A stop on an NPC's daily round: where to stand, and how long to stand there.
+ *
+ * Routines are deliberately short, fixed loops rather than anything resembling
+ * planning (CLAUDE.md §35, §17 — guards are not detectives, and neither is the
+ * clerk). The point is that a human watching for thirty seconds can describe
+ * what a normal NPC of that role does, because that description is the baseline
+ * a HUMAN in the same role has to imitate or be caught deviating from.
+ */
+export type RoutineStop = {
+  x: number;
+  z: number;
+  /** Seconds to stand here before moving on. */
+  seconds: number;
+  /** Randomised +/- this many seconds, so the loop is not a metronome. */
+  jitter?: number;
+  /** Facing while stood here. Defaults to the direction of travel. */
+  yaw?: number;
+};
+
+/**
+ * What each staff role does all day. Only the three non-combat singleton roles
+ * have one: the Security Officer's equivalent is the patrol duty, and a Guard's
+ * is his post.
+ */
+export const ROLE_ROUTINES: Partial<Record<Role, readonly RoutineStop[]>> = {
+  // Ward round, then the cabinet, then a supply run to Storage and back. The
+  // trip out of the ward is the important part — it is the window in which a
+  // human Doctor can be somewhere else without it looking odd.
+  doctor: [
+    { x: 7.5, z: 5.5, seconds: 25, jitter: 5, yaw: -Math.PI / 2 },
+    { x: 12.0, z: 4.5, seconds: 8, jitter: 2 },
+    { x: 4.6, z: 23.0, seconds: 12, jitter: 4 },
+    { x: 8.0, z: 9.0, seconds: 15, jitter: 4 },
+  ],
+
+  // Collect from the telegram room, carry to the General's desk. This is the
+  // same errand the human Secretary's delivery duty asks for, walked at the
+  // same pace, which is what makes the duty plausible cover.
+  secretary: [
+    { x: -8.0, z: 5.0, seconds: 18, jitter: 4 },
+    { x: 0.0, z: -17.5, seconds: 20, jitter: 5, yaw: Math.PI },
+  ],
+
+  // Sits at a console and deciphers. 150s +/- 30 is the "each decipher takes a
+  // random two to three minutes" rule; moving between the three consoles is
+  // just so he is not a statue.
+  telegram: [
+    { x: -9.6, z: 4.0, seconds: 150, jitter: 30, yaw: -Math.PI / 2 },
+    { x: -9.6, z: 7.0, seconds: 150, jitter: 30, yaw: -Math.PI / 2 },
+    { x: -9.6, z: 10.0, seconds: 150, jitter: 30, yaw: -Math.PI / 2 },
+  ],
+};
+
+/** Fixed positions for lying patients in the medical ward. */
+export const PATIENT_POSTS: readonly { x: number; z: number }[] = [
+  { x: 5.5, z: 4 },
+  { x: 5.5, z: 7 },
 ];
 
 /**
@@ -502,3 +610,42 @@ export const COMPOUND: CompoundMap = {
 };
 
 export const ROOM_COLORS = COLOR;
+
+export type ContainerDef = {
+  readonly id: number;
+  readonly label: string;
+  readonly x: number;
+  readonly z: number;
+  readonly room: RoomId;
+};
+
+/** Searchable containers — crates in Storage, medical cabinet, signals drawer. */
+export const CONTAINERS: readonly ContainerDef[] = [
+  { id: 0, label: 'Supply Crate', x: 3.0, z: 24.5, room: 'storage' },
+  { id: 1, label: 'Crate', x: 4.6, z: 24.5, room: 'storage' },
+  { id: 2, label: 'Tall Crate', x: 3.0, z: 27.5, room: 'storage' },
+  { id: 3, label: 'Medical Cabinet', x: 13.0, z: 3.5, room: 'medical_ward' },
+  { id: 4, label: 'Signals Drawer', x: -5.0, z: 3.2, room: 'telegram_room' },
+];
+
+/** Role-specific spawn positions — where each role starts a round. */
+export const ROLE_SPAWNS: Partial<Record<Role, Vec3>> = {
+  security: { x: -8, y: 0, z: 26 },
+  doctor: { x: 8, y: 0, z: 6 },
+  secretary: { x: -8, y: 0, z: -6 },
+  telegram: { x: -8, y: 0, z: 6 },
+  // Central hall, well clear of HQ. Human guards fan out from here onto the
+  // field posts; see GUARD_SPAWNS below.
+  guard: { x: 0, y: 0, z: 16 },
+};
+
+/**
+ * Where human Guards start, one each, in order. Drawn from the non-HQ posts so
+ * a player Guard begins the round standing somewhere a guard plausibly stands —
+ * and never in the ring around the General.
+ */
+export const GUARD_SPAWNS: readonly Vec3[] = FIELD_GUARD_POSTS.map((post) => ({
+  x: post.route[0]!.x,
+  y: 0,
+  z: post.route[0]!.z,
+}));

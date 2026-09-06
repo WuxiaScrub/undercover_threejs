@@ -16,6 +16,7 @@
 import type { DutyStatus } from './duty';
 import type { Faction } from './factions';
 import type { HitRegion } from './hitbox';
+import type { ItemId } from './inventory';
 import type { GroundItem } from './items';
 import type { GuardVoiceCue, NpcSnapshot } from './npc';
 import type { Role } from './roles';
@@ -29,7 +30,7 @@ import type { WeaponId } from './weapons';
 export type RoundPhase = 'lobby' | 'active' | 'over';
 
 /** Bumped whenever the message shapes change; mismatched clients are rejected. */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 7;
 
 export const NET_CONFIG = {
   port: 3000,
@@ -57,12 +58,26 @@ export const NET_CONFIG = {
   /** A socket exceeding this is misbehaving and gets dropped. */
   maxMessagesPerSecond: 150,
   maxNameLength: 16,
-  maxPlayers: 12,
+  /**
+   * Humans per match. The roster (shared/roster.ts) is defined for 2-4 and
+   * nothing else: the faction split and the NPC count are both fixed tables, so
+   * a fifth player has no seat to sit in.
+   */
+  maxPlayers: 4,
 } as const;
 
-/** Everything about a player that is PUBLIC. Faction is deliberately absent. */
+/**
+ * Everything about a player that is PUBLIC. Faction is deliberately absent —
+ * and so, now, is their chosen name.
+ *
+ * `name` carries the roster LABEL ("SECRETARY", "GUARD 3"), not what the player
+ * typed. The player's own name never leaves the server: knowing that the Doctor
+ * is called dave is knowing that the Doctor is a human being, which is exactly
+ * the deduction this prototype is trying to make impossible (CLAUDE.md §30).
+ */
 export type PlayerPublic = {
   id: number;
+  /** The public roster label. NOT the player's chosen name. */
   name: string;
   role: Role;
 };
@@ -85,6 +100,11 @@ export type PlayerSnapshot = {
    * what someone is hiding, however it is inspected (CLAUDE.md §14, §16).
    */
   weapon: WeaponId | null;
+  /**
+   * Publicly denounced by the Telegram Operator's broadcast. Everybody can see
+   * it — that is the entire mechanic — and it stays set for the round.
+   */
+  flagged?: boolean;
 };
 
 export type ClientMessage =
@@ -135,15 +155,47 @@ export type ClientMessage =
    * pistol must not both come up holding one.
    */
   | { t: 'pickup'; item: number }
-  /** Put a weapon on the floor in front of me. */
-  | { t: 'drop'; weapon: WeaponId }
+  /** Put an item on the floor in front of me. */
+  | { t: 'drop'; item: ItemId }
+  /** Use a non-weapon item from inventory (medkit heals; document is read). */
+  | { t: 'use'; item: ItemId }
   /**
    * "Open or shut that door." A request, not a statement: the server checks the
    * player is alive and actually standing next to it before flipping the bit.
    */
   | { t: 'door'; id: number }
+  /** Search a container at this id; server validates proximity and round state. */
+  | { t: 'openContainer'; id: number }
+  /** Proximity text chat. `broadcast:true` is Telegram Operator only. */
+  | { t: 'chat'; text: string; broadcast?: boolean }
+  /** Examine a patient to learn what they need. Server validates proximity + hold. */
+  | { t: 'examine'; patientId: number }
+  /** Treat a patient with a supply item. Server validates you have it. */
+  | { t: 'treat'; patientId: number; item: ItemId }
+  /** Request a telegram deciphering puzzle. */
+  | { t: 'startPuzzle' }
+  /** Answer to the current puzzle. */
+  | { t: 'puzzleAnswer'; word: string }
+  /**
+   * Security Officer: begin searching whoever is standing in front of me
+   * (CLAUDE.md §16). `target` is a player id or an NPC id — the officer cannot
+   * tell them apart, and neither can this message.
+   */
+  | { t: 'searchStart'; target: number }
+  /** End the search without taking anything. */
+  | { t: 'searchRelease' }
+  /** Take one item off the person currently being searched. */
+  | { t: 'confiscate'; item: ItemId }
+  /**
+   * Telegram Operator: denounce a character to the whole compound. The server
+   * checks the report item is in hand and consumes it. Whether `target` is the
+   * infiltrator the report named is entirely up to the operator.
+   */
+  | { t: 'broadcastReport'; target: number }
   | { t: 'respawn' }
-  | { t: 'ping'; id: number };
+  | { t: 'ping'; id: number }
+  /** Dev-only: force a full round restart. Server calls startRound immediately. */
+  | { t: 'reset' };
 
 export type ServerMessage =
   | {
@@ -159,7 +211,7 @@ export type ServerMessage =
       /** Everything currently lying on the floor. */
       items: GroundItem[];
       /** What you are carrying — see the note on the `inventory` message. */
-      inventory: WeaponId[];
+      inventory: ItemId[];
       /** Ids of the doors that are currently open; every other door is shut. */
       doors: number[];
     }
@@ -174,7 +226,7 @@ export type ServerMessage =
    * must never reach anyone else — only the weapon in your visible hand does,
    * via `PlayerSnapshot.weapon`.
    */
-  | { t: 'inventory'; weapons: WeaponId[] }
+  | { t: 'inventory'; items: ItemId[] }
   /** A weapon appeared on the floor — dropped, or spilled from a body. */
   | { t: 'itemAdded'; item: GroundItem }
   /** Somebody picked it up. Deliberately does not say who. */
@@ -276,7 +328,51 @@ export type ServerMessage =
     }
   | { t: 'spawned'; id: number; x: number; y: number; z: number }
   | { t: 'pong'; id: number }
-  | { t: 'reject'; reason: string };
+  | { t: 'reject'; reason: string }
+  /** Private notification to one player only — not a guard shout. */
+  | { t: 'alert'; text: string }
+  /** A container was searched; `items` lists what was inside (empty = nothing). */
+  | { t: 'container'; id: number; items: ItemId[] }
+  /** Proximity or broadcast chat message from another player. */
+  | { t: 'chatMsg'; from: number; name: string; text: string; channel: 'local' | 'broadcast' }
+  /** Minimap noise event for gunshots, melee, door interactions. */
+  | { t: 'noise'; x: number; z: number; kind: 'gunshot' | 'melee' | 'door' }
+  /** Public patient status (everyone sees wounded/critical/dead, not need). */
+  | { t: 'patients'; patients: { id: number; status: string }[] }
+  /** Private: what a patient needs — only sent to the examiner. */
+  | { t: 'examine'; patientId: number; need: string }
+  /** Compound-wide patient death announcement. */
+  | { t: 'announce'; text: string }
+  /** A telegram deciphering puzzle for the operator (sent privately). */
+  | { t: 'puzzle'; id: number; scrambled: string }
+  /**
+   * A search started or ended. Sent to everyone nearby, because two people
+   * standing perfectly still together is a PUBLIC event and half the value of
+   * the mechanic is bystanders seeing it happen (CLAUDE.md §16).
+   *
+   * `items` is the asymmetry: it is filled in ONLY on the copy addressed to the
+   * officer. Nobody else — including the person being searched — is told what
+   * was found, which is what lets an officer lie about it.
+   */
+  | {
+      t: 'search';
+      phase: 'begin' | 'end';
+      officer: number;
+      target: number;
+      items?: ItemId[];
+    }
+  /**
+   * The signals report, sent privately to the Telegram Operator when he reads
+   * the report item. `truth` is always a real infiltrator — the intelligence
+   * does not lie. Only the broadcast the operator makes from it can.
+   */
+  | {
+      t: 'report';
+      truth: number;
+      candidates: { id: number; label: string }[];
+    }
+  /** Somebody has been publicly denounced. Everyone is told, permanently. */
+  | { t: 'flagged'; id: number; label: string };
 
 /** Parse without ever throwing on a malformed or hostile frame. */
 export function decode<T>(raw: string): T | null {

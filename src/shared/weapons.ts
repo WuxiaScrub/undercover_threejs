@@ -79,26 +79,45 @@ export const WEAPONS: Record<WeaponId, WeaponDef> = {
  * exactly `weaponVisible && !canBrandish(role, weapon)`.
  */
 export function canBrandish(role: Role, weapon: WeaponId): boolean {
-  void weapon; // the Security Officer may openly carry either; nobody else may carry any
-  return role === 'security';
+  void weapon; // both armed roles may openly carry either; nobody else may carry any
+  return role === 'security' || role === 'guard';
 }
 
 /**
  * Who may PICK UP a weapon at all — a different question from `canBrandish`,
  * which is about being SEEN with one.
  *
- * A rifle is a metre of wood and steel: there is no version of carrying one
- * that is discreet, and no reason a clerk would ever be holding one. Only the
- * Security Officer can take a rifle off the floor, so a dead guard's rifle is
- * useful to exactly one public occupation and everyone else has to step over
- * it. The pistol is the concealable weapon and anybody may pocket one — the
- * whole hidden-pistol mechanic depends on it (CLAUDE.md §23).
+ * Anyone may now carry a rifle; the constraint is that non-Security roles cannot
+ * conceal it (`canConceal`). Picking it up forces it into their hands where the
+ * guards can see it — which is the risk. The pistol is the concealable weapon
+ * and anybody may pocket one — the whole hidden-pistol mechanic depends on it
+ * (CLAUDE.md §23).
  */
-export function canCarry(role: Role, weapon: WeaponId): boolean {
-  return weapon === 'rifle' ? role === 'security' : true;
+export function canCarry(_role: Role, _weapon: WeaponId): boolean {
+  return true;
 }
 
-/** What a role legitimately starts the round holding (CLAUDE.md §24). */
+/**
+ * Who may HIDE a weapon (holster or conceal it from view). A rifle is a metre
+ * of wood and steel: only the two roles issued one — the Security Officer and
+ * the Guard — can keep it out of sight. For everyone else it is permanently
+ * visible once they pick it up, and guards will immediately react to it, which
+ * is exactly the trade-off that makes picking up a dead guard's rifle
+ * interesting.
+ */
+export function canConceal(role: Role, weapon: WeaponId): boolean {
+  return weapon === 'rifle' ? role === 'security' || role === 'guard' : true;
+}
+
+/**
+ * What a role legitimately starts the round holding (CLAUDE.md §24).
+ *
+ * The Guard's rifle is the point of the role: it is the only way to be armed in
+ * public without being the one officer everybody is watching. He gets no pistol
+ * — the concealable weapon stays something you have to go and find.
+ */
 export function startingWeapons(role: Role): WeaponId[] {
-  return role === 'security' ? ['pistol', 'rifle'] : [];
+  if (role === 'security') return ['pistol', 'rifle'];
+  if (role === 'guard') return ['rifle'];
+  return [];
 }

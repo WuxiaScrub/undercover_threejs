@@ -1,4 +1,6 @@
-import { WEAPONS, type WeaponId, type WeaponState } from '../../shared/weapons';
+import { isWeaponItem, type ItemId } from '../../shared/inventory';
+import { canConceal, WEAPONS, type WeaponId, type WeaponState } from '../../shared/weapons';
+import type { Role } from '../../shared/roles';
 
 /**
  * The local player's one weapon slot (CLAUDE.md §14, §23).
@@ -20,8 +22,33 @@ export class WeaponSystem {
   /** Whether it is in the player's hands for all to see. */
   visible = false;
 
+  private role: Role = 'doctor';
   private cooldown = 0;
   private reloadLeft = 0;
+
+  setRole(role: Role): void {
+    this.role = role;
+    this.enforce();
+  }
+
+  /**
+   * If the player holds a rifle and cannot conceal it, force it into view.
+   * A non-Security role who picks up a rifle cannot holster it — the only
+   * way out is to drop it with [G]. Guards will react immediately.
+   */
+  private enforce(): void {
+    if (canConceal(this.role, 'rifle') || !this.owned.has('rifle')) return;
+    this.held = 'rifle';
+    this.visible = true;
+  }
+
+  /**
+   * True when the role cannot conceal the held rifle and the UI should show a
+   * discard hint. Used by Game to display the alert once.
+   */
+  get rifleForced(): boolean {
+    return this.owned.has('rifle') && !canConceal(this.role, 'rifle');
+  }
 
   get state(): WeaponState {
     if (!this.held) return 'unarmed';
@@ -65,6 +92,7 @@ export class WeaponSystem {
     // hand: a doctor who picked up a pistol and instantly brandished it would
     // be shot by the nearest guard for a keypress he never made.
     if (!this.held) this.setHeld(id);
+    this.enforce();
   }
 
   /**
@@ -72,7 +100,12 @@ export class WeaponSystem {
    * the inventory (it decides who won the race to a pistol on the floor), so this
    * is a reconciliation, not a merge: anything not on the list is gone.
    */
-  setInventory(list: readonly WeaponId[]): void {
+  setInventory(list: readonly ItemId[]): void {
+    // WeaponSystem only cares about weapons; supply items and documents bypass it.
+    return this.setWeaponInventory(list.filter(isWeaponItem));
+  }
+
+  private setWeaponInventory(list: readonly WeaponId[]): void {
     const held = this.held;
     const visible = this.visible;
 
@@ -90,6 +123,7 @@ export class WeaponSystem {
     const keep = candidate !== null && this.owned.has(candidate);
     this.held = keep ? candidate : null;
     this.visible = keep && visible && (candidate === held);
+    this.enforce();
   }
 
   /**
@@ -106,6 +140,7 @@ export class WeaponSystem {
     if (id === null) this.visible = false;
     // No instant shot on the swap.
     if (this.visible) this.cooldown = Math.max(this.cooldown, 0.2);
+    this.enforce();
   }
 
   /** Scroll through what you own. Positive = next. No-op with fewer than two. */
@@ -115,21 +150,29 @@ export class WeaponSystem {
     const at = this.held ? list.indexOf(this.held) : -1;
     const next = (((at + steps) % list.length) + list.length) % list.length;
     this.setHeld(list[next]);
+    this.enforce();
   }
 
   /**
    * Draw the selected weapon, or put it away — the single most consequential
    * button in the game, which is why it is a mouse button and not a number key.
+   *
+   * Returns true if the weapon was just drawn, false if put away (or nothing
+   * happened). Returns 'refused' if the role cannot conceal the held rifle —
+   * the caller should tell the player why ([G] to discard).
    */
-  toggleBrandish(): boolean {
+  toggleBrandish(): boolean | 'refused' {
     if (!this.held) return false;
     if (this.visible) {
+      // Block holstering a rifle for a non-Security role.
+      if (!canConceal(this.role, this.held)) return 'refused';
       this.conceal();
       return false;
     }
     this.visible = true;
     this.reloadLeft = 0;
     this.cooldown = Math.max(this.cooldown, 0.2); // no instant shot on the draw
+    this.enforce();
     return true;
   }
 
@@ -137,6 +180,7 @@ export class WeaponSystem {
   conceal(): void {
     this.visible = false;
     this.reloadLeft = 0;
+    this.enforce();
   }
 
   /** Throw away the selected weapon. Returns what left your hands. */
@@ -159,6 +203,7 @@ export class WeaponSystem {
     if (this.held !== id) return;
     this.held = this.owned.values().next().value ?? null;
     this.visible = false;
+    this.enforce();
   }
 
   clear(): void {

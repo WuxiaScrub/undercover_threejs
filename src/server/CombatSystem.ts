@@ -18,8 +18,9 @@ import {
 } from '../shared/combat';
 import { GAME_CONFIG } from '../shared/constants';
 import { round, type ServerMessage } from '../shared/net';
-import { GUARD_WEAPON, type NpcWorld } from '../shared/npc';
+import type { NpcWorld } from '../shared/npc';
 import type { Collider } from '../shared/types';
+import type { ItemId } from '../shared/inventory';
 import { WEAPONS, type WeaponId } from '../shared/weapons';
 import type { PlayerState } from './PlayerState';
 
@@ -48,8 +49,8 @@ export type CombatOutcome = {
   drops: Drop[];
 };
 
-/** Weapons to spill at a point — a corpse's inventory, or a guard's rifle. */
-export type Drop = { weapons: WeaponId[]; x: number; y: number; z: number };
+/** Items to spill at a point — a corpse's inventory, or a guard's rifle. */
+export type Drop = { items: ItemId[]; x: number; y: number; z: number };
 
 const nothing = (): CombatOutcome => ({
   toAll: [],
@@ -136,7 +137,7 @@ export class CombatSystem {
           region: outcome.region,
         });
         result.drops.push({
-          weapons: victim.inventoryList,
+          items: victim.inventoryList,
           x: victim.x,
           y: victim.y,
           z: victim.z,
@@ -147,7 +148,7 @@ export class CombatSystem {
       return result;
     }
 
-    const npcHit = npcs.applyDamage(outcome.targetId, damage, shooter.id);
+    const npcHit = npcs.applyDamage(outcome.targetId, damage, shooter.id, { x: shooter.x, z: shooter.z });
     if (!npcHit) return result;
 
     result.toAttacker.push({ t: 'hitmark', region: outcome.region, lethal: npcHit.killed });
@@ -160,9 +161,9 @@ export class CombatSystem {
         region: outcome.region,
       });
       const target = npcs.combatTargets().find((t) => t.id === outcome.targetId);
-      // A dead guard leaves his rifle where he fell. The General carries nothing.
-      if (npcHit.kind === 'guard' && target) {
-        result.drops.push({ weapons: [GUARD_WEAPON], x: target.x, y: target.y, z: target.z });
+      // A dead guard drops his issued rifle plus anything he confiscated.
+      if (npcHit.kind === 'guard' && target && npcHit.drops.length > 0) {
+        result.drops.push({ items: npcHit.drops, x: target.x, y: target.y, z: target.z });
       }
     }
     return result;
@@ -220,7 +221,7 @@ export class CombatSystem {
           cause: 'melee',
           region: null,
         });
-        result.drops.push({ weapons: victim.inventoryList, x: victim.x, y: victim.y, z: victim.z });
+        result.drops.push({ items: victim.inventoryList, x: victim.x, y: victim.y, z: victim.z });
         victim.inventory.clear();
         victim.visibleWeapon = null;
       } else {
@@ -230,13 +231,13 @@ export class CombatSystem {
       return result;
     }
 
-    const npcHit = npcs.applyDamage(hit.id, damage, attacker.id);
+    const npcHit = npcs.applyDamage(hit.id, damage, attacker.id, { x: attacker.x, z: attacker.z });
     if (!npcHit) return result;
     result.toAttacker.push({ t: 'hitmark', region: 'melee', lethal: npcHit.killed });
     if (npcHit.killed) {
       result.toAll.push({ t: 'death', id: hit.id, byId: attacker.id, cause: 'melee', region: null });
-      if (npcHit.kind === 'guard') {
-        result.drops.push({ weapons: [GUARD_WEAPON], x: hit.x, y: hit.y, z: hit.z });
+      if (npcHit.kind === 'guard' && npcHit.drops.length > 0) {
+        result.drops.push({ items: npcHit.drops, x: hit.x, y: hit.y, z: hit.z });
       }
     } else {
       // Stagger the surviving NPC and notify clients so the animation plays.

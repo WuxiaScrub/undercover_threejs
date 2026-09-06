@@ -40,6 +40,11 @@ export class RemotePlayer {
 
   /** Server-owned; the client is only told alive/dead, never a number. */
   alive = true;
+  /** Denounced by a telegraph broadcast. Permanent for the rest of the round. */
+  private flagged = false;
+  /** Standing still in a Security Officer's search right now. */
+  private searching = false;
+  private lastNote = '\u0000';
   /** Last interpolated pose, reused for collision and local hit prediction. */
   readonly pose = { x: 0, y: 0, z: 0, yaw: 0 };
 
@@ -58,7 +63,36 @@ export class RemotePlayer {
     const stats = ROLE_STATS[this.info.role];
     this.mesh.setBodyColor(stats.bodyColor);
     this.mesh.setModel(this.info.role);
-    this.tag.setText(this.info.name, stats.name);
+    this.lastNote = '\u0000';
+    this.refreshTag();
+  }
+
+  /**
+   * The tag is the ROLE and nothing else — no username, for players or NPCs
+   * alike. The second line is reserved for the three states everyone is allowed
+   * to know about, because a tag that said any more would tell you who is human.
+   */
+  private refreshTag(): void {
+    const note = !this.alive
+      ? 'DEAD'
+      : this.flagged
+        ? '*FLAGGED*'
+        : this.searching
+          ? 'SEARCHING'
+          : '';
+    if (note === this.lastNote) return;
+    this.lastNote = note;
+    this.tag.setText(this.info.name, note);
+  }
+
+  setFlagged(): void {
+    this.flagged = true;
+    this.refreshTag();
+  }
+
+  setSearching(on: boolean): void {
+    this.searching = on;
+    this.refreshTag();
   }
 
   /** What another player is visibly holding, for the guard rules and for humans. */
@@ -93,6 +127,8 @@ export class RemotePlayer {
       this.alive = snap.alive;
       this.mesh.setDead(!snap.alive);
     }
+    if (snap.flagged === true) this.flagged = true;
+    this.refreshTag();
 
     const last = this.samples[this.samples.length - 1];
     // Snapshots can arrive out of order over a lossy link; keep the buffer sorted.

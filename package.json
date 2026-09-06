@@ -16,8 +16,12 @@
     "test:doors": "tsx scripts/door-tests.ts",
     "test:round": "tsx scripts/round-tests.ts",
     "test:duty": "tsx scripts/duty-tests.ts",
+    "test:roster": "tsx scripts/roster-tests.ts",
+    "test:search": "tsx scripts/search-tests.ts",
+    "test:medical": "tsx scripts/medical-tests.ts",
+    "test:npc": "tsx scripts/npc-routine-tests.ts",
     "test:assets": "tsx scripts/asset-check.ts",
-    "test": "tsc --noEmit && tsx scripts/combat-matrix.ts && tsx scripts/guard-tests.ts && tsx scripts/nav-tests.ts && tsx scripts/door-tests.ts && tsx scripts/round-tests.ts && tsx scripts/duty-tests.ts && tsx scripts/asset-check.ts"
+    "test": "tsc --noEmit && tsx scripts/combat-matrix.ts && tsx scripts/guard-tests.ts && tsx scripts/nav-tests.ts && tsx scripts/door-tests.ts && tsx scripts/round-tests.ts && tsx scripts/duty-tests.ts && tsx scripts/roster-tests.ts && tsx scripts/search-tests.ts && tsx scripts/medical-tests.ts && tsx scripts/npc-routine-tests.ts && tsx scripts/asset-check.ts"
   },
   "dependencies": {
     "three": "^0.180.0",

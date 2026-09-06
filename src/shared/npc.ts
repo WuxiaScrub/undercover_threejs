@@ -21,22 +21,37 @@ import { moveBody, raycastColliders, standingClear, type Actor, type Body } from
 import { GAME_CONFIG } from './constants';
 import type { DoorField } from './doors';
 import { HIT_CLASS, type HitRegion } from './hitbox';
+import type { GroundItem, ItemField } from './items';
 import {
   COMPOUND,
   GENERAL_POST,
   GUARD_POSTS,
+  PATIENT_POSTS,
+  ROLE_ROUTINES,
   restrictedZoneAt,
+  type RoutineStop,
   type ZoneResponse,
 } from './mapData';
 import { clearLine, findPath, pathLength, walkable, type NavPoint } from './navgrid';
-import type { Role } from './roles';
+import { ROLE_STATS, type Role } from './roles';
+import { labelRoster } from './roster';
 import type { Collider, Vec3 } from './types';
+import { isWeaponItem, type ItemId } from './inventory';
 import { canBrandish, WEAPONS, type WeaponId } from './weapons';
 
 const cfg = GAME_CONFIG.guards;
 const gen = GAME_CONFIG.general;
 
-export type NpcKind = 'guard' | 'general';
+/**
+ * Which BRAIN an NPC runs — not who it is. Identity is `Npc.role`, because
+ * after the roster change a doctor may be a person or a routine and the label
+ * over their head must not say which (CLAUDE.md §30).
+ *
+ * `staff` is the routine brain: walk a short fixed loop, stand at each stop for
+ * a while, react to nothing. It covers the NPC Doctor, Secretary and Telegram
+ * Operator.
+ */
+export type NpcKind = 'guard' | 'general' | 'patient' | 'staff';
 
 /**
  * PATROL → SUSPICIOUS → WARNING → HOSTILE (CLAUDE.md §19), plus INVESTIGATING:
@@ -57,6 +72,8 @@ export const NPC_STATS = {
    */
   guard: { maxHealth: 120, color: 0x3f4a38, headColor: 0xb59672 },
   general: { maxHealth: 100, color: 0x7a2f2f, headColor: 0xc2a882 },
+  patient: { maxHealth: 50, color: 0xd4c8b0, headColor: 0xc2a882 },
+  staff: { maxHealth: 80, color: 0x3a4a5a, headColor: 0xb59672 },
 } as const;
 
 /** The guard's own weapon. Guards are authorised, so carrying it openly is normal. */
@@ -77,11 +94,25 @@ export type Perceivable = {
    * a hidden pistol is not something a guard can even be told about.
    */
   weapon: WeaponId | null;
+  /**
+   * Whether this person's role still buys them entry to a restricted zone.
+   *
+   * Only the Secretary can lose it, by missing her deliveries often enough
+   * (shared/duty.ts). Modelled as a flag on the person rather than as a second
+   * zone rule so that a banned Secretary is challenged by exactly the machinery
+   * that would challenge a Doctor at the same door — one enforcement path, not
+   * two. Absent means allowed, so nothing that does not care has to say so.
+   */
+  hqAccess?: boolean;
 };
 
 export type NpcSnapshot = {
   id: number;
   kind: NpcKind;
+  /** Public occupation. Drives the model and the nametag. */
+  role: Role;
+  /** The public roster label — "DOCTOR", "GUARD 3". Never a name. */
+  label: string;
   x: number;
   y: number;
   z: number;
@@ -90,6 +121,12 @@ export type NpcSnapshot = {
   mode: GuardMode;
   /** Non-null while the guard has his weapon up, so clients can draw it raised. */
   aiming: boolean;
+  /** The weapon this NPC is visibly carrying, or null (dead, unarmed, concealed). */
+  weapon: WeaponId | null;
+  /** Patients lie down; everyone else stands. */
+  pose: 'stand' | 'lie';
+  /** Publicly denounced by the Telegram Operator. Visible to everyone. */
+  flagged?: boolean;
 };
 
 /**
@@ -103,11 +140,15 @@ export type GuardVoiceCue = 'looking' | 'warn' | 'hostile' | 'threat_neutralized
 export type NpcEvent =
   | { t: 'shout'; id: number; text: string; x: number; z: number; cue?: GuardVoiceCue }
   | { t: 'shot'; id: number; weapon: WeaponId; origin: Vec3; end: Vec3 }
-  | { t: 'hit'; id: number; targetId: number; region: HitRegion; damage: number };
+  | { t: 'hit'; id: number; targetId: number; region: HitRegion; damage: number }
+  /** Guard picked up a dropped weapon. Clients remove it from the floor view. */
+  | { t: 'took'; id: number; itemId: number };
 
 type Npc = {
   id: number;
   kind: NpcKind;
+  /** Public occupation — what the nametag and the character model come from. */
+  role: Role;
   label: string;
   body: Body;
   yaw: number;
@@ -183,6 +224,25 @@ type Npc = {
    * are blocked while nowMs < stunnedUntil.
    */
   stunnedUntil: number;
+  /** Weapons this guard confiscated from the floor; dropped on death. */
+  carried: WeaponId[];
+  /**
+   * Active retrieve goal: walk to a dropped item and pick it up. Cleared when
+   * the item is gone, the deadline passes, or the guard stops being calm.
+   */
+  retrieve: { itemId: number; x: number; z: number; until: number } | null;
+  /** Unarmed orderly: shouts and calls guards, but does not shoot. */
+  unarmed: boolean;
+  /**
+   * A staff NPC's daily round, or null for everyone else. See `tickStaff`.
+   */
+  routine: readonly RoutineStop[] | null;
+  /** Index into `routine` of the stop currently being walked to or stood at. */
+  routineStop: number;
+  /** Seconds left standing at the current stop. Zero means "still walking". */
+  dwell: number;
+  /** Denounced by the Telegram Operator's broadcast; set for the round. */
+  flagged: boolean;
 };
 
 const EYE = 1.55;
@@ -277,6 +337,97 @@ function spreadSpot(npc: Npc, at: NavPoint): NavPoint {
   return walkable(out.x, out.z) && clearLine(at, out) ? out : at;
 }
 
+/**
+ * One character the compound has to staff itself with, as dealt by
+ * `shared/roster.ts`. A seat is deliberately just an occupation and the public
+ * label that goes above its head: nothing here says which brain will run it,
+ * because a Guard seat filled by an NPC and one filled by a human must be
+ * indistinguishable to everyone watching (CLAUDE.md §30).
+ */
+export type NpcSeat = { role: Role; label: string };
+
+/**
+ * The roster with no humans in it: every singleton role plus a full guard
+ * detail. This is what offline solo mode and the guard tests see, and it is
+ * also what the compound looks like before any player has taken a seat off it.
+ */
+export function defaultSeats(): NpcSeat[] {
+  const roles: Role[] = ['doctor', 'secretary', 'telegram'];
+  while (roles.length < 11) roles.push('guard');
+  const labels = labelRoster(roles, (r) => ROLE_STATS[r].name);
+  return roles.map((role, i) => ({ role, label: labels[i]! }));
+}
+
+type NpcOptions = {
+  id: number;
+  kind: NpcKind;
+  role: Role;
+  label: string;
+  x: number;
+  z: number;
+  yaw: number;
+  maxHealth: number;
+  route: readonly { x: number; z: number }[];
+  waypoint: number;
+  unarmed: boolean;
+  routine?: readonly RoutineStop[] | null;
+  dwell?: number;
+};
+
+/**
+ * Build one NPC. Everything an NPC needs to exist that is not about WHO it is —
+ * the whole threat brain's worth of timers, grudges and path caches — is the
+ * same zeroed state for all four kinds, so it lives here once instead of in
+ * four near-identical object literals inside `reset`.
+ */
+function makeNpc(o: NpcOptions): Npc {
+  return {
+    id: o.id,
+    kind: o.kind,
+    role: o.role,
+    label: o.label,
+    body: makeBody(o.x, o.z),
+    yaw: o.yaw,
+    health: o.maxHealth,
+    maxHealth: o.maxHealth,
+    alive: true,
+    route: o.route,
+    waypoint: o.waypoint,
+    postYaw: o.yaw,
+    mode: 'patrol',
+    targetId: null,
+    seenFor: 0,
+    modeTimer: 0,
+    lostSight: 0,
+    nextShotAt: 0,
+    provoked: false,
+    grudges: new Set(),
+    lastKnown: null,
+    investigate: null,
+    investigateTimer: 0,
+    investigateBearing: o.yaw,
+    alertLook: null,
+    alertLookTimer: 0,
+    investigateDeadline: 0,
+    path: null,
+    pathGoal: null,
+    repathIn: 0,
+    stuckFor: 0,
+    stuckRepathIn: 0,
+    cover: null,
+    coverTimer: 0,
+    hitsTaken: 0,
+    stunnedUntil: 0,
+    carried: [],
+    retrieve: null,
+    unarmed: o.unarmed,
+    routine: o.routine ?? null,
+    routineStop: 0,
+    dwell: o.dwell ?? 0,
+    flagged: false,
+  };
+}
+
 export class NpcWorld {
   private readonly npcs: Npc[] = [];
   private nextId = NPC_ID_BASE;
@@ -293,90 +444,118 @@ export class NpcWorld {
     this.reset();
   }
 
-  /** Rebuild every NPC at full health, back on post. Used by F8 and round start. */
-  reset(): void {
+  /**
+   * Rebuild every NPC at full health, back on post. Used by F8 and round start.
+   *
+   * `seats` is the NPC half of the round's roster (shared/roster.ts): one entry
+   * per character the compound has to staff itself, already labelled by the
+   * caller so that guard numbering runs across humans and NPCs together. The
+   * default is the whole compound with no humans in it, which is what offline
+   * solo mode wants and what the guard tests assert against.
+   *
+   * The four HQ posts are filled FIRST and out of the NPC pool only. A human
+   * Guard can be posted anywhere except the ring around the General, so that
+   * ring has to be manned before anything else is.
+   */
+  reset(seats: readonly NpcSeat[] = defaultSeats()): void {
     this.npcs.length = 0;
     this.pending.length = 0;
     this.nextId = NPC_ID_BASE;
 
-    for (const post of GUARD_POSTS) {
-      const start = post.route[0];
-      this.npcs.push({
-        id: this.nextId++,
-        kind: 'guard',
-        label: post.label,
-        body: makeBody(start.x, start.z),
-        yaw: post.yaw ?? 0,
-        health: NPC_STATS.guard.maxHealth,
-        maxHealth: NPC_STATS.guard.maxHealth,
-        alive: true,
-        route: post.route,
-        waypoint: post.route.length > 1 ? 1 : 0,
-        postYaw: post.yaw ?? 0,
-        mode: 'patrol',
-        targetId: null,
-        seenFor: 0,
-        modeTimer: 0,
-        lostSight: 0,
-        nextShotAt: 0,
-        provoked: false,
-        grudges: new Set<number>(),
-        lastKnown: null,
-        investigate: null,
-        investigateTimer: 0,
-        investigateBearing: post.yaw ?? 0,
-        alertLook: null,
-        alertLookTimer: 0,
-        investigateDeadline: cfg.investigateTimeout,
-        path: null,
-        pathGoal: null,
-        repathIn: 0,
-        stuckFor: 0,
-        stuckRepathIn: 0,
-        cover: null,
-        coverTimer: 0,
-        hitsTaken: 0,
-        stunnedUntil: 0,
-      });
+    const guardSeats = seats.filter((s) => s.role === 'guard');
+    const staffSeats = seats.filter((s) => s.role !== 'guard');
+
+    // HQ posts first, then the field posts from the far end — human Guards are
+    // spawned from the near end (GUARD_SPAWNS), so the two never collide.
+    const hqPosts = GUARD_POSTS.filter((p) => p.hq);
+    const fieldPosts = GUARD_POSTS.filter((p) => !p.hq);
+    const posts = [...hqPosts, ...[...fieldPosts].reverse()];
+
+    for (let i = 0; i < guardSeats.length; i++) {
+      const post = posts[i % posts.length]!;
+      const start = post.route[0]!;
+      this.npcs.push(
+        makeNpc({
+          id: this.nextId++,
+          kind: 'guard',
+          role: 'guard',
+          label: guardSeats[i]!.label,
+          x: start.x,
+          z: start.z,
+          yaw: post.yaw ?? 0,
+          maxHealth: NPC_STATS.guard.maxHealth,
+          route: post.route,
+          waypoint: post.route.length > 1 ? 1 : 0,
+          unarmed: post.unarmed ?? false,
+        }),
+      );
     }
 
-    this.npcs.push({
-      id: this.nextId++,
-      kind: 'general',
-      label: 'The General',
-      body: makeBody(GENERAL_POST.x, GENERAL_POST.z),
-      yaw: GENERAL_POST.yaw,
-      health: NPC_STATS.general.maxHealth,
-      maxHealth: NPC_STATS.general.maxHealth,
-      alive: true,
-      route: [{ x: GENERAL_POST.x, z: GENERAL_POST.z }],
-      waypoint: 0,
-      postYaw: GENERAL_POST.yaw,
-      mode: 'patrol',
-      targetId: null,
-      seenFor: 0,
-      modeTimer: 0,
-      lostSight: 0,
-      nextShotAt: 0,
-      provoked: false,
-      grudges: new Set<number>(),
-      lastKnown: null,
-      investigate: null,
-      investigateTimer: 0,
-      investigateBearing: GENERAL_POST.yaw,
-      alertLook: null,
-      alertLookTimer: 0,
-      investigateDeadline: cfg.investigateTimeout,
-      path: null,
-      pathGoal: null,
-      repathIn: 0,
-      stuckFor: 0,
-      stuckRepathIn: 0,
-      cover: null,
-      coverTimer: 0,
-      hitsTaken: 0,
-      stunnedUntil: 0,
-    });
+    for (const seat of staffSeats) {
+      const routine = ROLE_ROUTINES[seat.role] ?? null;
+      const start = routine?.[0] ?? { x: 0, z: 8 };
+      this.npcs.push(
+        makeNpc({
+          id: this.nextId++,
+          kind: 'staff',
+          role: seat.role,
+          label: seat.label,
+          x: start.x,
+          z: start.z,
+          yaw: routine?.[0]?.yaw ?? 0,
+          maxHealth: NPC_STATS.staff.maxHealth,
+          route: [{ x: start.x, z: start.z }],
+          waypoint: 0,
+          // Clerks and medics do not shoot. They are shootable, which is all a
+          // prototype needs from them.
+          unarmed: true,
+          routine,
+          // Start dwelling, so the first thing a player sees them do is the
+          // thing their job looks like rather than a walk from nowhere.
+          dwell: routine?.[0]?.seconds ?? 0,
+        }),
+      );
+    }
+
+    this.npcs.push(
+      makeNpc({
+        id: this.nextId++,
+        kind: 'general',
+        role: 'security',
+        label: 'THE GENERAL',
+        x: GENERAL_POST.x,
+        z: GENERAL_POST.z,
+        yaw: GENERAL_POST.yaw,
+        maxHealth: NPC_STATS.general.maxHealth,
+        route: [{ x: GENERAL_POST.x, z: GENERAL_POST.z }],
+        waypoint: 0,
+        unarmed: false,
+      }),
+    );
+
+    // Static patients in the medical ward — no brain, no patrol.
+    for (const post of PATIENT_POSTS) {
+      this.npcs.push(
+        makeNpc({
+          id: this.nextId++,
+          kind: 'patient',
+          role: 'doctor',
+          label: 'PATIENT',
+          x: post.x,
+          z: post.z,
+          yaw: 0,
+          maxHealth: NPC_STATS.patient.maxHealth,
+          route: [post],
+          waypoint: 0,
+          unarmed: true,
+        }),
+      );
+    }
+  }
+
+  /** The two ward patients, in the order PatientSystem should track them. */
+  get patientIds(): number[] {
+    return this.npcs.filter((n) => n.kind === 'patient').map((n) => n.id);
   }
 
   get generalId(): number {
@@ -391,13 +570,18 @@ export class NpcWorld {
     return this.npcs.map((n) => ({
       id: n.id,
       kind: n.kind,
+      role: n.role,
+      label: n.label,
       x: n.body.position.x,
       y: n.body.position.y,
       z: n.body.position.z,
       yaw: n.yaw,
       alive: n.alive,
       mode: n.mode,
+      flagged: n.flagged || undefined,
       aiming: n.kind === 'guard' && n.alive && (n.mode === 'warning' || n.mode === 'hostile'),
+      weapon: n.kind === 'guard' && n.alive && !n.unarmed ? GUARD_WEAPON : null,
+      pose: n.kind === 'patient' ? 'lie' : 'stand',
     }));
   }
 
@@ -443,7 +627,12 @@ export class NpcWorld {
    * Shooting a guard provokes every guard who could plausibly have noticed —
    * you do not get to pick them off one at a time in a corridor.
    */
-  applyDamage(id: number, amount: number, byId: number): { killed: boolean; kind: NpcKind } | null {
+  applyDamage(
+    id: number,
+    amount: number,
+    byId: number,
+    from?: { x: number; z: number },
+  ): { killed: boolean; kind: NpcKind; drops: WeaponId[] } | null {
     const npc = this.npcs.find((n) => n.id === id);
     if (!npc || !npc.alive) return null;
 
@@ -453,19 +642,24 @@ export class NpcWorld {
 
     if (npc.kind === 'general') {
       npc.hitsTaken++;
-      // Where the shot came FROM is not known here — provoke works off the
-      // victim's position, and the combat code does not hand up an origin. He
-      // finds out by looking, and assumes the door until he does.
-      this.alarmGeneral(npc, byId, null);
+      this.alarmGeneral(npc, byId, from ?? null);
     }
 
+    const at = { x: npc.body.position.x, z: npc.body.position.z };
     this.provoke(
       byId,
-      npc.body.position.x,
-      npc.body.position.z,
+      at,
       killed ? cfg.provokeRadiusOnKill : cfg.provokeRadiusOnHit,
+      from,
     );
-    return { killed, kind: npc.kind };
+
+    // A dead guard drops his issued weapon plus anything he confiscated.
+    const drops: WeaponId[] = [];
+    if (killed && npc.kind === 'guard') {
+      drops.push(GUARD_WEAPON, ...npc.carried);
+      npc.carried = [];
+    }
+    return { killed, kind: npc.kind, drops };
   }
 
   /**
@@ -479,15 +673,107 @@ export class NpcWorld {
     npc.stunnedUntil = Math.max(npc.stunnedUntil, this.nowMs + seconds * 1000);
   }
 
-  /** Make every guard within `radius` hostile toward `attackerId`. */
-  provoke(attackerId: number, x: number, z: number, radius: number): void {
+  /** Where an NPC is, or null if the id is not one. Used to check search reach. */
+  positionOf(id: number): { x: number; z: number } | null {
+    const npc = this.npcs.find((n) => n.id === id);
+    return npc ? { x: npc.body.position.x, z: npc.body.position.z } : null;
+  }
+
+  /** The public label of an NPC, for announcements naming a character. */
+  labelOf(id: number): string | null {
+    return this.npcs.find((n) => n.id === id)?.label ?? null;
+  }
+
+  /**
+   * Kill an NPC without provoking anybody (contrast `applyDamage`).
+   *
+   * A patient who dies of neglect has not been attacked, so nothing about it
+   * should make the compound's guards hostile toward anyone — but the body must
+   * still lie down, or the ward keeps a corpse standing at its bedside for the
+   * rest of the round. Returns false if the id is not a live NPC.
+   */
+  expire(id: number): boolean {
+    const npc = this.npcs.find((n) => n.id === id);
+    if (!npc || !npc.alive) return false;
+    npc.health = 0;
+    npc.alive = false;
+    return true;
+  }
+
+  /**
+   * What a Security Officer finds when he searches an NPC (CLAUDE.md §16).
+   *
+   * An armed guard is holding his issued rifle, plus anything he picked up off
+   * the floor. Everyone else is carrying nothing — which is itself information,
+   * because a searched NPC and a searched player produce the same shaped answer
+   * and the officer cannot tell from the result which he just stopped.
+   */
+  itemsOf(id: number): ItemId[] {
+    const npc = this.npcs.find((n) => n.id === id);
+    if (!npc || !npc.alive) return [];
+    const out: ItemId[] = [];
+    if (npc.kind === 'guard' && !npc.unarmed) out.push(GUARD_WEAPON);
+    out.push(...npc.carried);
+    return out;
+  }
+
+  /** Take one item off an NPC. Returns false if he does not have it. */
+  confiscate(id: number, item: ItemId): boolean {
+    const npc = this.npcs.find((n) => n.id === id);
+    if (!npc || !npc.alive) return false;
+    const i = npc.carried.indexOf(item as WeaponId);
+    if (i >= 0) {
+      npc.carried.splice(i, 1);
+      return true;
+    }
+    // His issued rifle: taking it disarms him for the rest of the round, which
+    // is a real decision for the officer rather than free loot.
+    if (item === GUARD_WEAPON && npc.kind === 'guard' && !npc.unarmed) {
+      npc.unarmed = true;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Mark an NPC as denounced by the Telegram Operator's broadcast. Purely a
+   * label — guard grudges are keyed to player ids, so a flagged NPC is hunted
+   * by the humans who believed the broadcast and by nobody else.
+   */
+  setFlagged(id: number): boolean {
+    const npc = this.npcs.find((n) => n.id === id);
+    if (!npc) return false;
+    npc.flagged = true;
+    return true;
+  }
+
+  /** Every character in the compound, for the report's candidate list. */
+  get rosterEntries(): { id: number; label: string; role: Role }[] {
+    return this.npcs
+      .filter((n) => n.kind === 'guard' || n.kind === 'staff')
+      .map((n) => ({ id: n.id, label: n.label, role: n.role }));
+  }
+
+  /**
+   * Make every guard within `radius` of `at` hostile toward `attackerId`.
+   * `lastKnown` is where guards will walk — defaults to `at` (the victim's
+   * position) but callers that know the shooter's position pass it so guards
+   * face the right way instead of crowding around the corpse.
+   */
+  provoke(
+    attackerId: number,
+    at: { x: number; z: number },
+    radius: number,
+    lastKnown?: { x: number; z: number },
+  ): void {
+    const dest = lastKnown ?? at;
     for (const n of this.npcs) {
       if (n.kind !== 'guard' || !n.alive) continue;
-      if (Math.hypot(n.body.position.x - x, n.body.position.z - z) > radius) continue;
+      if (Math.hypot(n.body.position.x - at.x, n.body.position.z - at.z) > radius) continue;
       n.provoked = true;
       n.targetId = attackerId;
       n.grudges.add(attackerId);
-      n.lastKnown = { x, z };
+      n.lastKnown = { x: dest.x, z: dest.z };
       n.lostSight = 0;
       // Through setMode, and only if he was not already hostile: it is what owes
       // the shooter a reaction delay. Setting the mode by hand here left every
@@ -495,6 +781,15 @@ export class NpcWorld {
       // the same frame the first shot landed — no warning, no beat to run.
       if (n.mode !== 'hostile') this.setMode(n, 'hostile', this.nowMs);
     }
+  }
+
+  /**
+   * Instantly hostile response to a door-access violation — no warning, because
+   * the rule is posted. Every guard within `doorViolationRadius` turns on the
+   * offender immediately.
+   */
+  reportViolation(playerId: number, at: { x: number; z: number }): void {
+    this.provoke(playerId, at, cfg.doorViolationRadius, at);
   }
 
   /**
@@ -574,6 +869,7 @@ export class NpcWorld {
     people: readonly Perceivable[],
     colliders: readonly Collider[],
     doors?: DoorField,
+    items?: ItemField,
   ): NpcEvent[] {
     // Remembered so damage arriving between ticks (provoke) can schedule against
     // the same clock the shooting code reads.
@@ -584,14 +880,64 @@ export class NpcWorld {
     for (const npc of this.npcs) {
       if (!npc.alive) continue;
       if (nowMs < npc.stunnedUntil) continue; // frozen by a melee hit
-      if (npc.kind === 'general') this.tickGeneral(npc, dt, people, colliders);
-      else this.tickGuard(npc, dt, nowMs, people, colliders, events);
-      doors?.openNear(npc.body.position.x, npc.body.position.z, reach);
+      if (npc.kind === 'patient') continue; // bedridden, no brain
+      if (npc.kind === 'staff') this.tickStaff(npc, dt, colliders);
+      else if (npc.kind === 'general') this.tickGeneral(npc, dt, people, colliders);
+      else this.tickGuard(npc, dt, nowMs, people, colliders, events, items);
+      // Who may push the ONE restricted door (the General's HQ) open: a guard
+      // who is chasing somebody, and the Secretary, whose entire job is
+      // carrying paper through it. A guard on his rounds leaves it alone, and
+      // so does everybody else — the door is only meaningful while it is shut.
+      const mayForce = npc.mode !== 'patrol' || npc.role === 'secretary';
+      doors?.openNear(npc.body.position.x, npc.body.position.z, reach, mayForce);
     }
     return events;
   }
 
   // ---------------------------------------------------------------- internals
+
+  /**
+   * The daily round of a Doctor, Secretary or Telegram Operator NPC.
+   *
+   * Deliberately the whole brain. Staff do not look at anybody, do not notice
+   * weapons, do not investigate noises and never shoot — they walk their loop
+   * and stand where the loop says to stand. That restraint is the point: a
+   * player watching the ward for thirty seconds must be able to describe what a
+   * normal Doctor does, because that description is the baseline against which
+   * a HUMAN doctor's deviation reads as suspicious (CLAUDE.md §34).
+   */
+  private tickStaff(npc: Npc, dt: number, colliders: readonly Collider[]): void {
+    const routine = npc.routine;
+    if (!routine || routine.length === 0) {
+      this.turnTowards(npc, npc.postYaw, dt);
+      this.step(npc, 0, 0, 0, dt, colliders);
+      return;
+    }
+
+    const stop = routine[npc.routineStop % routine.length]!;
+
+    if (npc.dwell > 0) {
+      npc.dwell -= dt;
+      // Facing matters while standing still — it is the difference between a
+      // clerk working at a console and a man staring at a wall.
+      this.turnTowards(npc, stop.yaw ?? npc.postYaw, dt);
+      this.step(npc, 0, 0, 0, dt, colliders);
+      return;
+    }
+
+    const d = Math.hypot(stop.x - npc.body.position.x, stop.z - npc.body.position.z);
+    if (d <= cfg.waypointReach) {
+      const jitter = stop.jitter ?? 0;
+      npc.dwell = Math.max(1, stop.seconds + (Math.random() * 2 - 1) * jitter);
+      npc.postYaw = stop.yaw ?? npc.yaw;
+      npc.routineStop = (npc.routineStop + 1) % routine.length;
+      this.dropRoute(npc);
+      this.step(npc, 0, 0, 0, dt, colliders);
+      return;
+    }
+
+    this.navigate(npc, stop, dt, colliders, cfg.patrolSpeed, true);
+  }
 
   private tickGuard(
     npc: Npc,
@@ -600,6 +946,7 @@ export class NpcWorld {
     people: readonly Perceivable[],
     colliders: readonly Collider[],
     events: NpcEvent[],
+    items?: ItemField,
   ): void {
     npc.modeTimer += dt;
     if (npc.alertLookTimer > 0) npc.alertLookTimer -= dt;
@@ -656,6 +1003,12 @@ export class NpcWorld {
       } else {
         npc.seenFor = Math.max(0, npc.seenFor - dt);
         if (npc.lostSight > cfg.loseSightAfter) npc.targetId = null;
+
+        // Calm guards pick up weapons that players dropped nearby (plan §6).
+        // Only in patrol mode (not investigating) so they don't detour mid-search.
+        if (npc.mode === 'patrol' && items) {
+          this.tickRetrieve(npc, nowMs, dt, colliders, items, events);
+        }
       }
 
       if (npc.mode === 'investigating') this.lookAround(npc, dt, colliders);
@@ -732,7 +1085,7 @@ export class NpcWorld {
     // HOSTILE. There is no talking him down now: putting the weapon away is a
     // conversation you should have had before he started shooting.
     const range = this.approach(npc, goal, dt, colliders, cfg.approachSpeed);
-    if (visible && range <= WEAPONS[GUARD_WEAPON].range && nowMs >= npc.nextShotAt) {
+    if (!npc.unarmed && visible && range <= WEAPONS[GUARD_WEAPON].range && nowMs >= npc.nextShotAt) {
       npc.nextShotAt = nowMs + cfg.fireInterval * 1000;
       this.shoot(npc, people, colliders, events);
     }
@@ -980,6 +1333,8 @@ export class NpcWorld {
   ): void {
     npc.mode = mode;
     npc.modeTimer = 0;
+    // Abandon any item-retrieval goal when going alert.
+    if (mode !== 'patrol') npc.retrieve = null;
     this.dropRoute(npc);
     if (mode === 'hostile') {
       // One more reaction delay before the first shot: the instant the guard
@@ -1167,6 +1522,86 @@ export class NpcWorld {
     if (npc.investigateTimer >= cfg.investigateLinger || npc.modeTimer >= npc.investigateDeadline) {
       this.standDown(npc);
     }
+  }
+
+  /**
+   * Handle the guard's retrieve goal: walk to a dropped item and confiscate it
+   * (plan §6). Only called while the guard is calm (patrol mode, no threat).
+   */
+  private tickRetrieve(
+    npc: Npc,
+    nowMs: number,
+    dt: number,
+    colliders: readonly Collider[],
+    items: ItemField,
+    events: NpcEvent[],
+  ): void {
+    const pos = npc.body.position;
+
+    // Check if the current goal is still valid.
+    if (npc.retrieve) {
+      const goal = npc.retrieve;
+      // Item disappeared (player beat him to it), deadline passed, or mode changed.
+      if (!items.get(goal.itemId) || nowMs > goal.until) {
+        npc.retrieve = null;
+        this.dropRoute(npc);
+        return;
+      }
+      // Navigate to the item (reusing patrol speed so he doesn't rush).
+      // tickRetrieve is called after seenFor/patrol logic which already consumed dt,
+      // so we forward the same dt we were given.
+      this.navigate(npc, goal, dt, colliders, cfg.patrolSpeed, true);
+      // Check arrival.
+      if (Math.hypot(pos.x - goal.x, pos.z - goal.z) <= GAME_CONFIG.items.reach) {
+        const item = items.remove(goal.itemId);
+        if (item) {
+          if (isWeaponItem(item.item)) npc.carried.push(item.item);
+          events.push({ t: 'took', id: npc.id, itemId: item.id });
+        }
+        npc.retrieve = null;
+        this.dropRoute(npc);
+        this.resumeRoute(npc);
+      }
+      return;
+    }
+
+    // Scan for the nearest visible dropped item.
+    const eye: Vec3 = { x: pos.x, y: pos.y + EYE, z: pos.z };
+    let best: GroundItem | null = null;
+    let bestDist: number = cfg.itemSightRadius;
+    for (const item of items.list()) {
+      if (!item.dropped || !isWeaponItem(item.item)) continue;
+      const dist = Math.hypot(item.x - pos.x, item.z - pos.z);
+      if (dist > bestDist) continue;
+      // View cone check.
+      const dx = item.x - pos.x;
+      const dz = item.z - pos.z;
+      const flat = Math.hypot(dx, dz);
+      if (flat > 1e-3) {
+        const facingX = -Math.sin(npc.yaw);
+        const facingZ = -Math.cos(npc.yaw);
+        const cos = (dx / flat) * facingX + (dz / flat) * facingZ;
+        if (cos < Math.cos(cfg.viewAngle)) continue;
+      }
+      // Line of sight to the item on the floor.
+      const tdx = item.x - eye.x;
+      const tdy = item.y - eye.y;
+      const tdz = item.z - eye.z;
+      const len = Math.hypot(tdx, tdy, tdz);
+      if (len < 1e-3) { best = item; bestDist = dist; continue; }
+      const dir: Vec3 = { x: tdx / len, y: tdy / len, z: tdz / len };
+      if (raycastColliders(eye, dir, len, colliders)) continue;
+      best = item;
+      bestDist = dist;
+    }
+    if (!best) return;
+
+    npc.retrieve = {
+      itemId: best.id,
+      x: best.x,
+      z: best.z,
+      until: nowMs + cfg.itemRetrieveDeadline * 1000,
+    };
   }
 
   /**
@@ -1554,7 +1989,10 @@ export function offenceOf(p: Perceivable): Offence | null {
     if (zone.noWeapons && p.weapon !== null) {
       return { kind: 'armed_in_zone', response: 'shoot', text: 'Weapon! Put him down!' };
     }
-    if (!zone.allow.includes(p.role)) {
+    // `hqAccess` is the secretary's revoked pass. Checked here rather than in a
+    // parallel rule so that a banned secretary is challenged by exactly the
+    // machinery that challenges a doctor at the same door.
+    if (!zone.allow.includes(p.role) || p.hqAccess === false) {
       return {
         kind: 'trespass',
         response: zone.response,

@@ -89,7 +89,7 @@ function run(s: Scenario): Result {
     for (const ev of events) {
       if (ev.t === 'shout') result.shouted = true;
       else if (ev.t === 'shot') result.shotsAtSubject++;
-      else if (ev.targetId === SUBJECT_ID) result.damageTaken += ev.damage;
+      else if (ev.t === 'hit' && ev.targetId === SUBJECT_ID) result.damageTaken += ev.damage;
     }
     for (const npc of world.snapshots()) {
       if (npc.kind !== 'guard') continue;

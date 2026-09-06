@@ -8,7 +8,7 @@
  * Fitness ordering: Security Officer > Doctor = Telegram Operator > Secretary.
  * Health values are from CLAUDE.md §10 and are used from milestone 3 onward.
  */
-export type Role = 'security' | 'doctor' | 'secretary' | 'telegram';
+export type Role = 'security' | 'guard' | 'doctor' | 'secretary' | 'telegram';
 
 export type StaminaStats = {
   /** Seconds of continuous sprinting from full, since drain is per second. */
@@ -50,10 +50,30 @@ export const ROLE_STATS: Record<Role, RoleStats> = {
     maxHealth: 200,
     walkSpeed: 4.0,
     sprintSpeed: 7,
-    jumpVelocity: 6.5,
+    jumpVelocity: 7.5,
     meleeDamage: 30,
     stamina: { max: 20, drainPerSecond: 1, regenPerSecond: 1.4, regenDelay: 0.5, recoverFraction: 0.25 },
     bodyColor: 0x4d5a44,
+  },
+
+  /**
+   * The compound's rank and file (CLAUDE.md §17). A playable Guard exists so a
+   * human can hide inside the one population nobody looks at twice — which only
+   * works if he is statted like the NPCs he is standing among rather than like a
+   * player-shaped exception. Fit, armed, and unremarkable.
+   */
+  guard: {
+    id: 'guard',
+    name: 'Guard',
+    maxHealth: 140,
+    walkSpeed: 3.9,
+    sprintSpeed: 6.2,
+    jumpVelocity: 6.5,
+    meleeDamage: 25,
+    stamina: { max: 12, drainPerSecond: 1, regenPerSecond: 1.0, regenDelay: 0.8, recoverFraction: 0.25 },
+    // NPC_STATS.guard.color exactly, so a human Guard cannot be picked out of
+    // the men he is posted with by his uniform.
+    bodyColor: 0x3f4a38,
   },
 
   doctor: {
@@ -62,7 +82,7 @@ export const ROLE_STATS: Record<Role, RoleStats> = {
     maxHealth: 100,
     walkSpeed: 3.8,
     sprintSpeed: 6.0,
-    jumpVelocity: 5, // ~0.69 m apex
+    jumpVelocity: 6.0, // ~0.69 m apex
     meleeDamage: 20,
     stamina: { max: 10, drainPerSecond: 1, regenPerSecond: 0.9, regenDelay: 1.0, recoverFraction: 0.25 },
     bodyColor: 0x8d9aa2,
@@ -74,7 +94,7 @@ export const ROLE_STATS: Record<Role, RoleStats> = {
     maxHealth: 120,
     walkSpeed: 4.2,
     sprintSpeed: 6.0,
-    jumpVelocity: 5.5,
+    jumpVelocity: 6.5,
     meleeDamage: 20,
     stamina: { max: 12, drainPerSecond: 1, regenPerSecond: 0.9, regenDelay: 1.0, recoverFraction: 0.25 },
     bodyColor: 0x7a6f4e,
@@ -87,11 +107,11 @@ export const ROLE_STATS: Record<Role, RoleStats> = {
     maxHealth: 90,
     walkSpeed: 3.5,
     sprintSpeed: 4.5,
-    jumpVelocity: 3.5, // ~0.34 m apex — clears a threshold, not a crate
+    jumpVelocity: 5.5, // ~0.34 m apex — clears a threshold, not a crate
     meleeDamage: 15,
     stamina: { max: 10, drainPerSecond: 1, regenPerSecond: 0.5, regenDelay: 1.5, recoverFraction: 0.25 },
     bodyColor: 0x6a5a6b,
   },
 };
 
-export const ROLE_ORDER: Role[] = ['security', 'doctor', 'telegram', 'secretary'];
+export const ROLE_ORDER: Role[] = ['security', 'guard', 'doctor', 'telegram', 'secretary'];

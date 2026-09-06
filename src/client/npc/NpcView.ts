@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { GUARD_WEAPON, NPC_STATS, type NpcSnapshot } from '../../shared/npc';
+import { NPC_STATS, type NpcSnapshot } from '../../shared/npc';
+import type { CharacterModelId } from '../player/CharacterAssets';
 import { CharacterMesh, localVelocity } from '../player/CharacterMesh';
 import { NameTag } from '../ui/NameTag';
 
@@ -17,25 +18,17 @@ const EASE_PER_SECOND = 14;
 /** Ceiling on the speed the gait is driven from, in m/s. See NpcActor.update. */
 const SPEED_CLAMP = 6;
 
-/** Modes worth telling the player about; 'patrol' is just a guard doing his job. */
-const MODE_LABEL: Record<string, string> = {
-  investigating: 'LOOKING...',
-  suspicious: 'SUSPICIOUS',
-  warning: 'WARNING',
-  hostile: 'HOSTILE',
-};
-
 /**
- * The General reuses the guard modes to move, but they read as nonsense over
- * his head: he is not investigating anything and he is not hostile to anyone —
- * he is a man with no gun deciding whether the pillar is still good enough.
+ * The character model an NPC is drawn with. The General and the ward patients
+ * are special-cased because their KIND is what you can see about them; everyone
+ * else is drawn from their ROLE, which is the whole point — an NPC Doctor and a
+ * human Doctor must be the same model in the same clothes, and `guard` is the
+ * fallback because that is the population a stranger disappears into.
  */
-const GENERAL_MODE_LABEL: Record<string, string> = {
-  investigating: 'TAKING COVER',
-  suspicious: 'ALARMED',
-  warning: 'ALARMED',
-  hostile: 'FLEEING',
-};
+function modelFor(snap: NpcSnapshot): CharacterModelId {
+  if (snap.kind === 'general' || snap.kind === 'patient') return snap.kind;
+  return snap.role;
+}
 
 class NpcActor {
   readonly group = new THREE.Group();
@@ -51,16 +44,9 @@ class NpcActor {
   constructor(snap: NpcSnapshot) {
     const stats = NPC_STATS[snap.kind];
     this.mesh = new CharacterMesh(stats.color, stats.headColor);
-    // `guard` and `general` are folder names under assets/3d/characters/ as
-    // much as they are NPC kinds; the General keeps the placeholder until one
-    // exists for him, which is fine — he is meant to read as distinct, not good.
-    this.mesh.setModel(snap.kind);
+    this.mesh.setModel(modelFor(snap));
     this.group.add(this.mesh.group);
     this.group.add(this.tag.sprite);
-
-    // A guard's rifle is always in his hands: he is authorised, and seeing that
-    // he is armed is exactly the information a player needs (CLAUDE.md §22).
-    if (snap.kind === 'guard') this.mesh.setWeapon(GUARD_WEAPON);
 
     this.group.position.set(snap.x, snap.y, snap.z);
     this.target.x = snap.x;
@@ -70,25 +56,43 @@ class NpcActor {
     this.apply(snap);
   }
 
-  apply(snap: NpcSnapshot): void {
+  apply(snap: NpcSnapshot, searching = false): void {
     this.target.x = snap.x;
     this.target.y = snap.y;
     this.target.z = snap.z;
     this.target.yaw = snap.yaw;
     this.aiming = snap.aiming;
 
+    // Drive weapon visibility from snapshot so dead NPCs drop their weapon model
+    // and unarmed orderlies never show a rifle.
+    this.mesh.setWeapon(snap.weapon ?? null);
+
     if (this.dead !== !snap.alive) {
       this.dead = !snap.alive;
       this.mesh.setDead(this.dead);
     }
 
-    const general = snap.kind === 'general';
-    const base = general ? 'THE GENERAL' : 'GUARD';
-    const labels = general ? GENERAL_MODE_LABEL : MODE_LABEL;
-    const label = snap.alive ? (labels[snap.mode] ?? '') : 'DEAD';
-    if (label !== this.lastLabel) {
-      this.lastLabel = label;
-      this.tag.setText(base, label);
+    // Lying pose for patients.
+    if (snap.pose === 'lie' && snap.alive) {
+      this.mesh.group.rotation.x = Math.PI / 2;
+    } else if (this.mesh.group.rotation.x !== 0) {
+      this.mesh.group.rotation.x = 0;
+    }
+
+    // Nothing about the guard state machine reaches the tag any more: a man who
+    // has just decided to shoot you looks exactly like a man on his rounds, and
+    // finding out which is the game (CLAUDE.md §34).
+    const note = !snap.alive
+      ? 'DEAD'
+      : snap.flagged
+        ? '*FLAGGED*'
+        : searching
+          ? 'SEARCHING'
+          : '';
+    const line = `${snap.label}|${note}`;
+    if (line !== this.lastLabel) {
+      this.lastLabel = line;
+      this.tag.setText(snap.label, note);
     }
   }
 
@@ -138,8 +142,14 @@ export class NpcView {
 
   constructor(private readonly scene: THREE.Scene) {}
 
-  /** Feed the whole NPC list; actors are created and removed to match. */
-  apply(snaps: readonly NpcSnapshot[]): void {
+  /**
+   * Feed the whole NPC list; actors are created and removed to match.
+   *
+   * @param searching ids currently held in a search. It is not a snapshot field
+   *   because it is not world state — it is what THIS client has been told, and
+   *   only people standing close enough to watch are told at all.
+   */
+  apply(snaps: readonly NpcSnapshot[], searching?: ReadonlySet<number>): void {
     for (const snap of snaps) {
       let actor = this.actors.get(snap.id);
       if (!actor) {
@@ -147,7 +157,7 @@ export class NpcView {
         this.actors.set(snap.id, actor);
         this.scene.add(actor.group);
       }
-      actor.apply(snap);
+      actor.apply(snap, searching?.has(snap.id) ?? false);
     }
 
     if (this.actors.size === snaps.length) return;

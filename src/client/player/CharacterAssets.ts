@@ -29,7 +29,7 @@ import type { Role } from '../../shared/roles';
 import { WEAPONS, type WeaponId } from '../../shared/weapons';
 
 /** Folder name under `assets/3d/characters/`, which is also the model's name. */
-export type CharacterModelId = Role | 'guard' | 'general';
+export type CharacterModelId = Role | 'general' | 'patient';
 
 /**
  * The clips the movement code can actually ask for.

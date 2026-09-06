@@ -8,11 +8,13 @@ import {
   type CombatTarget,
 } from '../../shared/combat';
 import { GAME_CONFIG } from '../../shared/constants';
-import { DoorField, type DoorDef } from '../../shared/doors';
+import { doorById, doorPermits, DoorField, type DoorDef } from '../../shared/doors';
 import { PatrolDuty, type DutyStatus } from '../../shared/duty';
+import { PatientSystem } from '../../shared/medical';
 import type { Faction } from '../../shared/factions';
+import { ITEMS, isWeaponItem, type ItemId } from '../../shared/inventory';
 import { ItemField } from '../../shared/items';
-import { COMPOUND, HIDDEN_PISTOL_SPOTS, restrictedZoneAt } from '../../shared/mapData';
+import { COMPOUND, CONTAINERS, HIDDEN_PISTOL_SPOTS, restrictedZoneAt } from '../../shared/mapData';
 import {
   NET_CONFIG,
   round,
@@ -21,7 +23,6 @@ import {
   type ServerMessage,
 } from '../../shared/net';
 import {
-  GUARD_WEAPON,
   NpcWorld,
   type GuardVoiceCue,
   type NpcSnapshot,
@@ -48,6 +49,7 @@ import { PlayerController } from '../player/PlayerController';
 import { RemotePlayer } from '../player/RemotePlayer';
 import { DebugOverlay, type DebugPose } from '../ui/DebugOverlay';
 import { HUD } from '../ui/HUD';
+import { Minimap } from '../ui/Minimap';
 import { WeaponSystem } from '../weapons/WeaponSystem';
 import { CameraRig } from './CameraRig';
 import { Input } from './Input';
@@ -103,8 +105,31 @@ export class Game {
   private lastHitText = '';
   /** Weapons offered by the open discard menu, or null when it is shut. */
   private discardMenu: WeaponId[] | null = null;
+  /** Full item inventory (weapons + supplies + documents), server-authoritative. */
+  private fullInventory: ItemId[] = [];
   /** The restricted zone we last warned about, so it is said once per entry. */
   private lastZoneWarning: string | null = null;
+
+  private readonly minimap: Minimap;
+
+  // container hold-to-interact
+  private searchTarget: { id: number; label: string; x: number; z: number } | null = null;
+  private searchTimer = 0;
+  /** Set while a telegram puzzle is waiting for an answer. */
+  private puzzleActive = false;
+  /**
+   * The search this client is a party to, or null.
+   *
+   * `items` is present ONLY when we are the officer — the server never puts the
+   * list on anybody else's copy, and the client must not invent one, because an
+   * officer being able to lie about what he found is the whole mechanic
+   * (CLAUDE.md §16).
+   */
+  private activeSearch: { officer: number; target: number; items: ItemId[] | null } | null = null;
+  /** Ids currently held in a search, for the SEARCHING tag on NPCs. */
+  private readonly searchingIds = new Set<number>();
+  /** Candidates from the last signals report read, while its panel is open. */
+  private reportCandidates: readonly { id: number; label: string }[] = [];
 
   private readonly bots: DummyBot[] = [];
   private nextBotId = -1;
@@ -146,6 +171,11 @@ export class Game {
   private dutyAt = 0;
   /** Offline only: the SAME PatrolDuty the server runs, not a second version. */
   private offlineDuty: PatrolDuty | null = null;
+  /**
+   * The ward, offline only. Online the server owns it — this exists so one
+   * person can walk the medical loss path solo before a playtest.
+   */
+  private readonly offlinePatients = new PatientSystem();
   /** Only ticked offline; online the server owns the guards. */
   private readonly npcs = new NpcWorld();
   /** Latest NPC poses, from our own tick or from the server. */
@@ -205,6 +235,8 @@ export class Game {
     this.scene.add(this.compound.group);
     this.scene.add(this.playerMesh.group);
 
+    this.minimap = new Minimap();
+
     this.applyRole();
     const spawn = COMPOUND.spawnPoints[0];
     this.player.setPosition(spawn.x, spawn.y, spawn.z);
@@ -214,6 +246,18 @@ export class Game {
     // The browser will not start audio until the player interacts; the click
     // that grabs pointer lock is that interaction.
     this.input.onPointerLock = () => this.audio.resume();
+
+    // Proximity chat is off for this build (plan M6). The text line survives as
+    // the telegram decipher input and nothing else types into it; the server's
+    // `chat` case is still there, unreachable, so turning it back on is small.
+    this.input.onTextSubmit = (text) => {
+      this.hud.showChatInput(false);
+      if (!this.puzzleActive) return;
+      this.puzzleActive = false;
+      const trimmed = (text ?? '').trim().slice(0, 200);
+      if (!trimmed) return;
+      if (this.net.connected) this.net.send({ t: 'puzzleAnswer', word: trimmed });
+    };
 
     this.net.onMessage = this.onServerMessage;
     this.net.onStatus = (status, detail) => {
@@ -283,6 +327,7 @@ export class Game {
     this.meleeCooldown = Math.max(0, this.meleeCooldown - delta);
     this.moveLock = Math.max(0, this.moveLock - delta);
     this.handleCombatInput();
+    this.handleInventoryKeys();
     this.handleDebugKeys();
     this.syncWeaponState();
 
@@ -293,7 +338,7 @@ export class Game {
     for (const bot of this.bots) bot.update(delta);
     this.effects.update(delta);
     this.itemView.update(delta);
-    this.npcView.apply(this.npcSnapshots);
+    this.npcView.apply(this.npcSnapshots, this.searchingIds);
     this.npcView.update(delta);
 
     const feet = this.player.body.position;
@@ -322,6 +367,14 @@ export class Game {
       this.weapons,
     );
     this.updateDebugText();
+
+    // Minimap — egocentric, drawn each frame.
+    this.minimap.draw(feet.x, feet.z, this.player.facingYaw);
+
+    // Chat input display.
+    if (this.input.textMode) {
+      this.hud.showChatInput(true, this.input.textBuffer);
+    }
 
     this.renderer.render(this.scene, this.rig.camera);
     this.input.endFrame();
@@ -445,8 +498,31 @@ export class Game {
       return;
     }
 
-    // E is the environment key: a weapon at your feet, or the door in front of you.
-    if (this.input.wasPressed('KeyE')) this.handleUseKey();
+    // A search pins both parties in place for as long as the officer holds them
+    // (CLAUDE.md §16). It takes over the keyboard while it lasts — pointer lock
+    // is never released, so the compound goes on happening around two people
+    // who are standing perfectly still in the middle of it.
+    if (this.activeSearch) {
+      this.moveLock = Math.max(this.moveLock, 0.2);
+      const items = this.activeSearch.items;
+      // Only the officer has a list, and only the officer can end it early.
+      if (items) {
+        if (this.input.wasPressed('KeyE')) this.net.send({ t: 'searchRelease' });
+        for (let i = 0; i < items.length && i < 9; i++) {
+          if (!this.input.wasPressed(`Digit${i + 1}`)) continue;
+          this.net.send({ t: 'confiscate', item: items[i]! });
+          break;
+        }
+      }
+      return;
+    }
+
+    // [F] search whoever is standing in front of you.
+    if (this.input.wasPressed('KeyF')) this.handleSearchKey();
+
+    // E held near a container = hold-to-search. E pressed elsewhere = door/item.
+    this.tickContainerSearch();
+    if (this.input.wasPressed('KeyE') && !this.searchTarget) this.handleUseKey();
     // G throws away what you are holding. With nothing drawn it asks which of
     // the things in your bag you meant.
     if (this.input.wasPressed('KeyG')) this.handleDiscardKey();
@@ -460,7 +536,10 @@ export class Game {
     // the difference between a clerk walking down a corridor and a clerk a
     // guard is about to shoot. Nothing else may draw a weapon for you.
     // Suppressed while stunned: a stun must be a real freeze.
-    if (this.input.mousePressed(MOUSE_RIGHT) && this.moveLock <= 0) this.weapons.toggleBrandish();
+    if (this.input.mousePressed(MOUSE_RIGHT) && this.moveLock <= 0) {
+      const result = this.weapons.toggleBrandish();
+      if (result === 'refused') this.hud.showAlert('Cannot conceal a rifle — [G] to discard');
+    }
 
     // Scroll picks WHICH weapon without changing whether it is on show.
     const wheel = this.input.consumeWheel();
@@ -494,11 +573,14 @@ export class Game {
    * metre of wood and steel: only the Security Officer can pick one up, and the
    * prompt says so rather than silently doing nothing (item 3).
    */
-  private reachableItem(): { id: number; weapon: WeaponId; allowed: boolean } | null {
+  private reachableItem(): { id: number; item: ItemId; allowed: boolean } | null {
     const feet = this.player.body.position;
-    const item = this.items.nearest(feet.x, feet.z);
-    if (!item || this.weapons.owns(item.weapon)) return null;
-    return { ...item, allowed: canCarry(this.player.stats.id, item.weapon) };
+    const ground = this.items.nearest(feet.x, feet.z);
+    if (!ground) return null;
+    // Already carrying one of this item.
+    if (isWeaponItem(ground.item) && this.weapons.owns(ground.item)) return null;
+    const allowed = !isWeaponItem(ground.item) || canCarry(this.player.stats.id, ground.item);
+    return { id: ground.id, item: ground.item, allowed };
   }
 
   /**
@@ -509,7 +591,7 @@ export class Game {
   private handleUseKey(): void {
     const item = this.reachableItem();
     if (item) {
-      if (item.allowed) this.pickUp(item.id, item.weapon);
+      if (item.allowed) this.pickUp(item.id, item.item);
       return;
     }
     const door = this.reachableDoor();
@@ -531,6 +613,11 @@ export class Game {
     }
     this.doors.toggle(id);
     this.compound.syncDoors(this.doors);
+    // Offline: check access after toggling so the door opens (reaction is the consequence).
+    const def = doorById(id);
+    if (def && !doorPermits(def, this.player.stats.id, this.weapons.visible ? (this.weapons.held ?? null) : null)) {
+      this.npcs.reportViolation(this.localId, { x: def.x, z: def.z });
+    }
   }
 
   /**
@@ -551,7 +638,49 @@ export class Game {
     }
     this.discardMenu = kit;
   }
-  private pickUp(id: number, weapon: WeaponId): void {
+  /**
+   * Ask the server to search whoever is nearest (CLAUDE.md §16).
+   *
+   * The target is only ever an id. A player and an NPC are reached the same
+   * way, refused the same way and produce the same shaped answer — an officer
+   * who could tell from the interface which of the guards in this corridor were
+   * people would have broken the disguise the whole roster is built on.
+   */
+  private handleSearchKey(): void {
+    if (!this.net.connected) {
+      this.hud.showAlert('Searching requires a server connection.');
+      return;
+    }
+    const target = this.searchableNear();
+    if (target) this.net.send({ t: 'searchStart', target: target.id });
+  }
+
+  /** The nearest live character within arm's reach, player or NPC alike. */
+  private searchableNear(): { id: number; label: string } | null {
+    if (this.player.stats.id !== 'security' || !this.net.connected) return null;
+    const feet = this.player.body.position;
+    let best: { id: number; label: string } | null = null;
+    let bestDist: number = GAME_CONFIG.search.reach;
+
+    for (const remote of this.remotes.values()) {
+      if (!remote.alive) continue;
+      const d = Math.hypot(remote.pose.x - feet.x, remote.pose.z - feet.z);
+      if (d >= bestDist) continue;
+      bestDist = d;
+      best = { id: remote.info.id, label: remote.info.name };
+    }
+    for (const npc of this.npcSnapshots) {
+      // The General is not frisked and a patient in a bed cannot stand up.
+      if (!npc.alive || npc.kind === 'general' || npc.kind === 'patient') continue;
+      const d = Math.hypot(npc.x - feet.x, npc.z - feet.z);
+      if (d >= bestDist) continue;
+      bestDist = d;
+      best = { id: npc.id, label: npc.label };
+    }
+    return best;
+  }
+
+  private pickUp(id: number, itemId: ItemId): void {
     // Played on the request, not the confirmation: if the server refuses because
     // somebody beat us to it, a stray click is a far smaller cost than 60 ms of
     // dead air on every successful pickup.
@@ -565,14 +694,16 @@ export class Game {
     }
     this.items.remove(id);
     this.itemView.remove(id);
-    this.weapons.give(weapon);
-    // Taking a weapon should not put it in your hand in front of a guard.
-    this.weapons.conceal();
+    if (isWeaponItem(itemId)) {
+      this.weapons.give(itemId);
+      // Taking a weapon should not put it in your hand in front of a guard.
+      this.weapons.conceal();
+    }
   }
 
   private dropWeapon(weapon: WeaponId): void {
     if (this.net.connected) {
-      this.net.send({ t: 'drop', weapon });
+      this.net.send({ t: 'drop', item: weapon });
       return;
     }
     const feet = this.player.body.position;
@@ -585,6 +716,17 @@ export class Game {
   private promptText(): string {
     if (!this.alive) return '';
 
+    // Both sides of a search see a line, and they are deliberately different:
+    // the officer is reading a list nobody else will ever see.
+    const search = this.activeSearch;
+    if (search) {
+      const items = search.items;
+      if (!items) return 'YOU ARE BEING SEARCHED';
+      if (items.length === 0) return 'NOTHING ON HIM   ·   [E] release';
+      const rows = items.slice(0, 9).map((id, i) => `[${i + 1}] ${ITEMS[id].name}`).join('   ');
+      return `${rows}   ·   [E] release`;
+    }
+
     if (this.discardMenu) {
       const choices = this.discardMenu
         .map((id, i) => `[${i + 1}] ${WEAPONS[id].name}`)
@@ -592,18 +734,35 @@ export class Game {
       return `DISCARD:  ${choices}   ·   [G] cancel`;
     }
 
+    const frisk = this.searchableNear();
+    if (frisk) return `[F]  search ${frisk.label}`;
+
     const item = this.reachableItem();
     if (item) {
-      const name = WEAPONS[item.weapon].name;
+      const name = ITEMS[item.item].name;
       return item.allowed
         ? `[E]  pick up ${name}`
         : `${name} — only the Security Officer may carry this`;
     }
 
+    // Container nearby?
+    const feet2 = this.player.body.position;
+    const container = CONTAINERS.find((c) => {
+      const dx = c.x - feet2.x;
+      const dz = c.z - feet2.z;
+      return Math.sqrt(dx * dx + dz * dz) <= GAME_CONFIG.world.containerReach;
+    });
+    if (container) {
+      return `[E hold]  search ${container.label}`;
+    }
+
     const door = this.reachableDoor();
     if (door) {
       const verb = this.doors.isOpen(door.id) ? 'close' : 'open';
-      return `[E]  ${verb} the ${door.label} door`;
+      const visWep = this.weapons.visible ? (this.weapons.held ?? null) : null;
+      const permitted = doorPermits(door, this.player.stats.id, visWep);
+      const warning = permitted ? '' : ' — RESTRICTED, GUARDS WILL FIRE';
+      return `[E]  ${verb} the ${door.label} door${warning}`;
     }
 
     const held = this.weapons.held;
@@ -648,6 +807,8 @@ export class Game {
     if (!this.net.connected && this.roundPhase === 'active') {
       if (!this.npcs.generalAlive) {
         this.endOfflineRound('infiltrator', 'The General is dead.');
+      } else if (this.offlinePatients.deadCount >= roundCfg.patientsLostToLose) {
+        this.endOfflineRound('infiltrator', 'The medical ward was lost.');
       } else if (performance.now() >= this.roundEndsAt) {
         this.endOfflineRound('loyalist', 'The General survived the day.');
       }
@@ -728,6 +889,9 @@ export class Game {
 
   /** A solo round starts the moment you drop into the compound alone. */
   private startOfflineRound(): void {
+    // One id space: the ward's patients ARE the bodies lying in it, so the
+    // solo ward is seeded from the NPC world exactly as the server's is.
+    this.offlinePatients.reset(this.npcs.patientIds);
     this.roundPhase = 'active';
     this.roundEndsAt = performance.now() + roundCfg.durationSeconds * 1000;
     this.roundPlayers = 1;
@@ -737,10 +901,76 @@ export class Game {
   }
 
   /**
+   * Full round restart for offline solo mode. Mirrors what `GameServer.startRound`
+   * does online so F8 works the same either way (plan §1).
+   */
+  private resetOfflineWorld(): void {
+    // Guards and General back to their posts, grudges cleared.
+    this.npcs.reset();
+    this.npcSnapshots = this.npcs.snapshots();
+
+    // Items: sweep and reseed.
+    this.items.clear();
+    this.itemView.reset([]);
+    this.seedOfflineItems();
+
+    // Doors: shut them all.
+    this.doors.setAll([]);
+    this.compound.syncDoors(this.doors);
+
+    // Player kit: restore role's starting loadout.
+    const role = ROLE_ORDER[this.roleIndex];
+    this.weapons.clear();
+    for (const weapon of startingWeapons(role)) this.weapons.give(weapon);
+    if (!canBrandish(role, 'pistol')) this.weapons.conceal();
+
+    // Vitals.
+    this.health = this.maxHealth;
+    this.moveLock = 0;
+    this.meleeCooldown = 0;
+    this.activeSearch = null;
+    this.searchingIds.clear();
+    this.hud.hideReport();
+    this.setAlive(true);
+    this.unstick();
+
+    // Bots.
+    for (const bot of this.bots) bot.reset();
+
+    // Duty.
+    this.offlineDuty = null;
+    this.dutyStatus = null;
+
+    // Kick off the new round (sets roundPhase = 'active', hides the result banner).
+    this.startOfflineRound();
+  }
+
+  /**
    * Solo mode runs the SAME guard brain the server runs, so the mandatory §37
    * guard test can be done by one person with no second machine. Online this
    * does nothing — guard state arrives in snapshots.
    */
+  /**
+   * The solo ward, and the bridge between its two halves — the same
+   * reconciliation `GameServer.tickPatients` does, for the same reason: a
+   * patient must never be dead in one system and alive in the other.
+   */
+  private tickOfflinePatients(dt: number): void {
+    for (const patient of this.offlinePatients.all) {
+      if (patient.status === 'dead') continue;
+      if (this.npcs.info(patient.id)?.alive !== false) continue;
+      if (this.offlinePatients.kill(patient.id, 'gunfire')) {
+        this.hud.showAlert('A PATIENT HAS BEEN SHOT IN THE MEDICAL WARD');
+      }
+    }
+    const { deaths } = this.offlinePatients.tick(dt);
+    for (const id of deaths) {
+      // Neglect is not an attack: the body lies down and no guard is provoked.
+      this.npcs.expire(id);
+      this.hud.showAlert('A PATIENT HAS DIED IN THE MEDICAL WARD');
+    }
+  }
+
   private tickOfflineNpcs(dt: number): void {
     if (this.net.connected) return;
 
@@ -765,8 +995,10 @@ export class Game {
       this.people,
       this.doors.solids(),
       this.doors,
+      this.items,
     );
     if (this.doors.openIds().length !== openBefore) this.compound.syncDoors(this.doors);
+    this.tickOfflinePatients(dt);
     this.npcSnapshots = this.npcs.snapshots();
 
     for (const ev of events) {
@@ -777,6 +1009,18 @@ export class Game {
       if (ev.t === 'shot') {
         this.effects.shot(ev.origin, ev.end, false);
         this.audio.gunshot(ev.weapon, ev.origin);
+        // Guard shot may hit a corpse already on the floor.
+        const gDx = ev.end.x - ev.origin.x;
+        const gDy = ev.end.y - ev.origin.y;
+        const gDz = ev.end.z - ev.origin.z;
+        const gLen = Math.hypot(gDx, gDy, gDz) || 1;
+        this.splashCorpseBlood(ev.origin, { x: gDx / gLen, y: gDy / gLen, z: gDz / gLen }, gLen);
+        continue;
+      }
+      if (ev.t === 'took') {
+        // Guard confiscated a dropped item — remove it from the floor view.
+        this.items.remove(ev.itemId);
+        this.itemView.remove(ev.itemId);
         continue;
       }
       if (ev.targetId === this.localId) {
@@ -859,7 +1103,8 @@ export class Game {
     // Solo: resolve it ourselves, against debug bots and the local NPC world.
     if (outcome.kind !== 'hit') return;
     const damage = damageFor(weapon, outcome.region);
-    const killed = this.applyOfflineDamage(outcome.targetId, damage);
+    const feet = this.player.body.position;
+    const killed = this.applyOfflineDamage(outcome.targetId, damage, { x: feet.x, z: feet.z });
     if (killed === null) return;
     this.hud.showHitmarker(killed);
     this.lastHitText = `${weapon} → ${outcome.region} ${damage} dmg${killed ? ' (KILL)' : ''}`;
@@ -869,21 +1114,25 @@ export class Game {
    * Offline damage to whatever we just hit. Returns whether it died, or null if
    * the id belongs to nothing we own — online, that is the server's business.
    */
-  private applyOfflineDamage(targetId: number, damage: number): boolean | null {
+  private applyOfflineDamage(
+    targetId: number,
+    damage: number,
+    from?: { x: number; z: number },
+  ): boolean | null {
     const bot = this.bots.find((b) => b.id === targetId);
     if (bot) return bot.applyDamage(damage);
 
     const before = this.npcSnapshots.find((n) => n.id === targetId);
-    const result = this.npcs.applyDamage(targetId, damage, this.localId);
+    const result = this.npcs.applyDamage(targetId, damage, this.localId, from);
     if (!result) return null;
     // Shooting a guard is loud in the social sense too: the survivors come for
     // you, and that is exactly the risk the assassination is supposed to carry.
     this.npcSnapshots = this.npcs.snapshots();
 
     if (result.killed) {
-      // A dead guard's rifle is the single best reason to take the risk.
-      if (result.kind === 'guard' && before) {
-        for (const item of this.items.spill([GUARD_WEAPON], before.x, before.y, before.z)) {
+      // A dead guard drops his issued rifle plus anything he confiscated.
+      if (result.kind === 'guard' && before && result.drops.length > 0) {
+        for (const item of this.items.spill(result.drops, before.x, before.y, before.z)) {
           this.itemView.add(item);
         }
       }
@@ -897,7 +1146,7 @@ export class Game {
    * grow their blood puddle. Purely visual — no server involvement.
    */
   private splashCorpseBlood(origin: Vec3, dir: Vec3, range: number): void {
-    const check = (cx: number, cy: number, cz: number): boolean => {
+    const tryHit = (cx: number, cy: number, cz: number): boolean => {
       // Closest point on the ray segment to the character's torso centre.
       const tx = cx - origin.x;
       const ty = cy + 0.85 - origin.y;
@@ -906,21 +1155,23 @@ export class Game {
       const px = origin.x + dir.x * t - cx;
       const py = origin.y + dir.y * t - (cy + 0.85);
       const pz = origin.z + dir.z * t - cz;
-      return Math.hypot(px, py, pz) < 0.55;
+      if (Math.hypot(px, py, pz) >= 0.55) return false;
+      this.effects.spurt({ x: origin.x + dir.x * t, y: origin.y + dir.y * t, z: origin.z + dir.z * t }, dir);
+      return true;
     };
 
     for (const bot of this.bots) {
       if (bot.alive) continue;
-      if (check(bot.x, bot.y, bot.z)) { bot.addBlood(); return; }
+      if (tryHit(bot.x, bot.y, bot.z)) { bot.addBlood(); return; }
     }
     for (const npc of this.npcSnapshots) {
       if (npc.alive) continue;
-      if (check(npc.x, npc.y, npc.z)) { this.npcView.addBlood(npc.id); return; }
+      if (tryHit(npc.x, npc.y, npc.z)) { this.npcView.addBlood(npc.id); return; }
     }
     for (const remote of this.remotes.values()) {
       if (remote.alive) continue;
       const p = remote.pose;
-      if (check(p.x, p.y, p.z)) { remote.addBlood(); return; }
+      if (tryHit(p.x, p.y, p.z)) { remote.addBlood(); return; }
     }
   }
 
@@ -950,7 +1201,7 @@ export class Game {
     );
     if (!hit) return;
     const damage = meleeDamageFor(this.player.stats.id);
-    const killed = this.applyOfflineDamage(hit.id, damage);
+    const killed = this.applyOfflineDamage(hit.id, damage, { x: feet.x, z: feet.z });
     if (killed === null) return;
     // Only a LANDED strike is heard, and barely — a miss is silent. Mirrors the
     // server's ordering in CombatSystem.melee, which returns before the noise.
@@ -1058,6 +1309,120 @@ export class Game {
 
   // ------------------------------------------------------------- debug keys
 
+  private handleInventoryKeys(): void {
+    // The report takes the keyboard while it is open, the same way the discard
+    // menu does: a digit denounces that character to the whole compound, which
+    // is the single most consequential key in the game, so nothing else may be
+    // listening at the same time.
+    if (this.hud.isReportOpen()) {
+      if (this.input.wasPressed('Escape')) {
+        this.hud.hideReport();
+        return;
+      }
+      for (let i = 0; i < this.reportCandidates.length && i < 9; i++) {
+        if (!this.input.wasPressed(`Digit${i + 1}`)) continue;
+        this.net.send({ t: 'broadcastReport', target: this.reportCandidates[i]!.id });
+        this.hud.hideReport();
+        return;
+      }
+      return;
+    }
+
+    // [P] request a telegram puzzle (Telegram Operator only, online)
+    if (this.input.wasPressed('KeyP') && this.player.stats.id === 'telegram') {
+      if (this.net.connected) this.net.send({ t: 'startPuzzle' });
+      else this.hud.showAlert('Telegram puzzles require a server connection.');
+    }
+
+    if (this.input.wasPressed('KeyI') || this.input.wasPressed('Tab')) {
+      this.hud.toggleInventory();
+    }
+    if (!this.hud.isInventoryOpen()) return;
+
+    // [U] use the selected item
+    if (this.input.wasPressed('KeyU')) {
+      const sel = this.hud.selectedItem();
+      if (sel && sel !== 'pistol' && sel !== 'rifle') {
+        if (this.net.connected) {
+          this.net.send({ t: 'use', item: sel });
+        } else {
+          this.applyItemUseOffline(sel);
+        }
+      }
+    }
+
+    // [G] drop the selected item
+    if (this.input.wasPressed('KeyG') && this.hud.isInventoryOpen()) {
+      const sel = this.hud.selectedItem();
+      if (sel) {
+        if (isWeaponItem(sel)) this.dropWeapon(sel);
+        else {
+          if (this.net.connected) {
+            this.net.send({ t: 'drop', item: sel });
+          } else {
+            const feet = this.player.body.position;
+            this.fullInventory = this.fullInventory.filter((i) => i !== sel);
+            this.hud.syncInventory(this.fullInventory);
+            this.itemView.add(this.items.dropInFront(sel, feet.x, feet.y, feet.z, this.player.facingYaw));
+          }
+        }
+      }
+    }
+  }
+
+  private applyItemUseOffline(item: ItemId): void {
+    if (item === 'medkit') {
+      this.health = this.maxHealth;
+      this.fullInventory = this.fullInventory.filter((i) => i !== item);
+      this.hud.syncInventory(this.fullInventory);
+    }
+  }
+
+  private tickContainerSearch(): void {
+    const feet = this.player.body.position;
+    const reach = GAME_CONFIG.world.containerReach;
+
+    if (this.input.isDown('KeyE')) {
+      // Find nearest container in reach.
+      const container = CONTAINERS.find((c) => {
+        const dx = c.x - feet.x;
+        const dz = c.z - feet.z;
+        return Math.sqrt(dx * dx + dz * dz) <= reach;
+      });
+
+      if (container) {
+        // If we just started targeting this container, initialise the timer.
+        if (!this.searchTarget || this.searchTarget.id !== container.id) {
+          this.searchTarget = { id: container.id, label: container.label, x: container.x, z: container.z };
+          this.searchTimer = 0;
+        }
+        this.searchTimer += FIXED_STEP;
+        const fraction = this.searchTimer / GAME_CONFIG.world.containerSearchSeconds;
+        this.hud.setSearchProgress(fraction, `SEARCHING ${container.label.toUpperCase()}…`);
+
+        if (this.searchTimer >= GAME_CONFIG.world.containerSearchSeconds) {
+          // Search complete.
+          this.hud.setSearchProgress(null);
+          if (this.net.connected) {
+            this.net.send({ t: 'openContainer', id: container.id });
+          } else {
+            this.hud.showAlert('(Nothing found — offline mode)');
+          }
+          this.searchTarget = null;
+          this.searchTimer = 0;
+        }
+        return;
+      }
+    }
+
+    // E released or no container in reach.
+    if (this.searchTarget) {
+      this.searchTarget = null;
+      this.searchTimer = 0;
+      this.hud.setSearchProgress(null);
+    }
+  }
+
   private handleDebugKeys(): void {
     if (this.input.wasPressed('F1')) this.debug.toggleColliders();
     if (this.input.wasPressed('F2')) this.debug.toggleHitboxes();
@@ -1083,19 +1448,8 @@ export class Game {
     if (this.input.wasPressed('F7')) this.weapons.give('rifle');
 
     if (this.input.wasPressed('F8')) {
-      this.health = this.maxHealth;
-      this.moveLock = 0;
-      this.meleeCooldown = 0;
-      if (!this.alive) {
-        this.setAlive(true);
-        this.unstick();
-      }
-      for (const bot of this.bots) bot.reset();
-      // Guards too, or one botched test leaves the compound permanently hostile.
-      if (!this.net.connected) {
-        this.npcs.reset();
-        this.npcSnapshots = this.npcs.snapshots();
-      }
+      if (this.net.connected) this.net.send({ t: 'reset' });
+      else this.resetOfflineWorld();
     }
 
     if (this.input.wasPressed('F9')) this.unstick();
@@ -1140,6 +1494,7 @@ export class Game {
     this.playerMesh.setBodyColor(this.player.stats.bodyColor);
     this.playerMesh.setModel(role);
     this.hud.setRole(this.player.stats);
+    this.weapons.setRole(role);
 
     // Max health is per role, so changing role has to reset it or the damage
     // rules stop meaning what they say. The server does the same on its side.
@@ -1164,6 +1519,7 @@ export class Game {
     this.playerMesh.setModel(role);
     this.hud.setRole(this.player.stats);
     this.maxHealth = this.player.stats.maxHealth;
+    this.weapons.setRole(role);
     // Health is corrected by the server's `health` message that follows.
     this.net.setRole(role);
   }
@@ -1247,7 +1603,9 @@ export class Game {
         this.items.clear();
         for (const item of msg.items) this.items.insert(item);
         this.itemView.reset(msg.items);
+        this.fullInventory = msg.inventory;
         this.weapons.setInventory(msg.inventory);
+        this.hud.syncInventory(msg.inventory);
 
         // Likewise the doors: whatever we had open solo is not what this
         // compound looks like now.
@@ -1295,7 +1653,9 @@ export class Game {
       }
 
       case 'inventory': {
-        this.weapons.setInventory(msg.weapons);
+        this.fullInventory = msg.items;
+        this.weapons.setInventory(msg.items);
+        this.hud.syncInventory(msg.items);
         break;
       }
 
@@ -1372,12 +1732,16 @@ export class Game {
       case 'shot': {
         // Our own tracer and report were already produced the instant we clicked.
         if (msg.id === this.localId) break;
-        this.effects.shot(
-          { x: msg.ox, y: msg.oy, z: msg.oz },
-          { x: msg.hx, y: msg.hy, z: msg.hz },
-          false,
-        );
-        this.audio.gunshot(msg.weapon, { x: msg.ox, y: msg.oy, z: msg.oz });
+        const shotOrigin = { x: msg.ox, y: msg.oy, z: msg.oz };
+        const shotEnd = { x: msg.hx, y: msg.hy, z: msg.hz };
+        this.effects.shot(shotOrigin, shotEnd, false);
+        this.audio.gunshot(msg.weapon, shotOrigin);
+        // Show blood on corpses hit by other players too.
+        const shotDx = shotEnd.x - shotOrigin.x;
+        const shotDy = shotEnd.y - shotOrigin.y;
+        const shotDz = shotEnd.z - shotOrigin.z;
+        const shotLen = Math.hypot(shotDx, shotDy, shotDz) || 1;
+        this.splashCorpseBlood(shotOrigin, { x: shotDx / shotLen, y: shotDy / shotLen, z: shotDz / shotLen }, shotLen);
         break;
       }
 
@@ -1437,6 +1801,92 @@ export class Game {
         this.lastCorrection = msg.reason;
         break;
       }
+
+      case 'alert': {
+        this.hud.showAlert(msg.text);
+        break;
+      }
+
+      case 'container': {
+        if (msg.items.length === 0) {
+          this.hud.showAlert('Container is empty.');
+        } else {
+          this.hud.showAlert(`Found: ${msg.items.map((id) => ITEMS[id].name).join(', ')}`);
+        }
+        // Items are already on the floor via itemsReset; local view updates from server.
+        break;
+      }
+
+      case 'chatMsg': {
+        this.hud.addChatLine(msg.name, msg.text, msg.channel);
+        break;
+      }
+
+      case 'noise': {
+        this.minimap.addNoise(msg.x, msg.z, msg.kind);
+        break;
+      }
+
+      case 'patients': {
+        // Public patient status update — could update a future ward UI.
+        break;
+      }
+
+      case 'examine': {
+        this.hud.showAlert(`Patient needs: ${msg.need.toUpperCase()}`);
+        break;
+      }
+
+      case 'announce': {
+        this.hud.showAlert(msg.text);
+        break;
+      }
+
+      case 'puzzle': {
+        // The decipher input opens itself. It used to hang off the chat key,
+        // which no longer exists (plan M6).
+        this.puzzleActive = true;
+        this.input.enterTextMode();
+        this.hud.showChatInput(true, '', `DECIPHER ${msg.scrambled}`);
+        break;
+      }
+
+      case 'search': {
+        this.searchingIds.delete(msg.officer);
+        this.searchingIds.delete(msg.target);
+        this.remotes.get(msg.officer)?.setSearching(false);
+        this.remotes.get(msg.target)?.setSearching(false);
+        if (msg.phase === 'end') {
+          if (msg.officer === this.localId || msg.target === this.localId) {
+            this.activeSearch = null;
+          }
+          break;
+        }
+        this.searchingIds.add(msg.officer);
+        this.searchingIds.add(msg.target);
+        this.remotes.get(msg.officer)?.setSearching(true);
+        this.remotes.get(msg.target)?.setSearching(true);
+        if (msg.officer === this.localId || msg.target === this.localId) {
+          // `items` rides on the officer's copy and nobody else's — including
+          // the copy sent to the person being searched.
+          this.activeSearch = { officer: msg.officer, target: msg.target, items: msg.items ?? null };
+        }
+        break;
+      }
+
+      case 'report': {
+        this.reportCandidates = msg.candidates;
+        const named = msg.candidates.find((c) => c.id === msg.truth);
+        this.hud.showReport(named?.label ?? 'SOMEONE IN THIS COMPOUND', msg.candidates);
+        break;
+      }
+
+      case 'flagged': {
+        // The announcement arrives separately, as its own compound-wide line.
+        // This is only the tag, and it stays up for the rest of the round.
+        this.remotes.get(msg.id)?.setFlagged();
+        break;
+      }
     }
   };
 
@@ -1478,7 +1928,7 @@ export class Game {
       `items    ${this.items.list().length} on the floor   carrying ${this.weapons.inventory.join('+') || 'nothing'}`,
       `frame    ${this.frameTimeMs.toFixed(1)} ms`,
       `net      ${this.netLine()}`,
-      `F1 colliders:${this.debug.collidersVisible ? 'ON' : 'off'}  F2 hitboxes:${this.debug.hitboxesVisible ? 'ON' : 'off'}  F3 vision:${this.debug.visionVisible ? 'ON' : 'off'}  F5 role  F6/F7 arm  F8 reset  F9 unstick`,
+      `F1 colliders:${this.debug.collidersVisible ? 'ON' : 'off'}  F2 hitboxes:${this.debug.hitboxesVisible ? 'ON' : 'off'}  F3 vision:${this.debug.visionVisible ? 'ON' : 'off'}  F5 role  F6/F7 arm  F8 reset round  F9 unstick`,
       `B spawn bot   N bot role   V bot weapon   M clear bots`,
       `E pick up   G discard   RMB draw/put away   SCROLL switch   LMB shoot/strike   R reload`,
     ]);
