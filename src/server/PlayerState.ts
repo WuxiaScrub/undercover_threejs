@@ -4,7 +4,7 @@ import { ROLE_STATS, type Role } from '../shared/roles';
 import type { CombatTarget } from '../shared/combat';
 import type { Perceivable } from '../shared/npc';
 import type { ItemId } from '../shared/inventory';
-import { startingWeapons, type WeaponId } from '../shared/weapons';
+import { startingWeapons, startingVisibleWeapon, type WeaponId } from '../shared/weapons';
 
 /** How far outside the compound a position may sit before it is nonsense. */
 const BOUNDS_MARGIN = 3;
@@ -151,6 +151,7 @@ export class PlayerState {
     this.role = role;
     this.health = ROLE_STATS[role].maxHealth;
     this.alive = true;
+    this.visibleWeapon = startingVisibleWeapon(role);
     this.inventory.clear();
     for (const w of startingWeapons(role)) this.inventory.add(w);
   }
@@ -168,7 +169,7 @@ export class PlayerState {
   revive(x: number, y: number, z: number, now: number): void {
     this.health = this.maxHealth;
     this.alive = true;
-    this.visibleWeapon = null;
+    this.visibleWeapon = startingVisibleWeapon(this.role);
     // Your kit stayed with your corpse; you come back with what the role issues.
     this.inventory.clear();
     for (const w of startingWeapons(this.role)) this.inventory.add(w);

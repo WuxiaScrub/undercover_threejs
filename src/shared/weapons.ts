@@ -121,3 +121,13 @@ export function startingWeapons(role: Role): WeaponId[] {
   if (role === 'guard') return ['rifle'];
   return [];
 }
+
+/**
+ * Which weapon, if any, a player of this role should have visibly drawn on
+ * spawn/respawn. Guards carry their rifle openly — every NPC guard does too,
+ * and the one guard in the compound without a rifle in hand would be a tell.
+ */
+export function startingVisibleWeapon(role: Role): WeaponId | null {
+  if (role === 'guard') return 'rifle';
+  return null;
+}

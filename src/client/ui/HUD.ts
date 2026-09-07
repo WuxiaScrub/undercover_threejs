@@ -292,6 +292,14 @@ export class HUD {
     return this.inventoryItems[this.inventorySelected] ?? null;
   }
 
+  /** Jump directly to a row by index (0-based). Clamps to valid range. */
+  setSelected(index: number): ItemId | null {
+    if (this.inventoryItems.length === 0) return null;
+    this.inventorySelected = Math.max(0, Math.min(index, this.inventoryItems.length - 1));
+    this.renderInventory();
+    return this.inventoryItems[this.inventorySelected] ?? null;
+  }
+
   /** The currently selected item (or null when inventory is empty). */
   selectedItem(): ItemId | null {
     return this.inventoryItems[this.inventorySelected] ?? null;

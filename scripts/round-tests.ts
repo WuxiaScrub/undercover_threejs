@@ -14,6 +14,7 @@ import { GAME_CONFIG } from '../src/shared/constants';
 import { PlayerState } from '../src/server/PlayerState';
 import { RoundSystem, type WorldStatus } from '../src/server/RoundSystem';
 import { infiltratorsFor } from '../src/shared/roster';
+import { COMPOUND, GUARD_SPAWNS, ROLE_SPAWNS, nearGeneralHq } from '../src/shared/mapData';
 
 let failures = 0;
 function check(label: string, ok: boolean, detail = ''): void {
@@ -237,6 +238,34 @@ console.log('\n=== no player name ever leaves the server ===');
     reveal.reveal.every((r) => r.name !== '' && !players.some((p) => p.name === r.name)),
     reveal.reveal.map((r) => r.name).join(' | '),
   );
+}
+
+console.log('\n=== spawn keep-out: nobody spawns in HQ territory ===');
+{
+  for (const sp of COMPOUND.spawnPoints) {
+    check(
+      `spawn (${sp.x}, ${sp.z}) is outside the HQ keep-out zone`,
+      !nearGeneralHq(sp.x, sp.z),
+      `x=${sp.x} z=${sp.z}`,
+    );
+  }
+
+  for (const sp of GUARD_SPAWNS) {
+    check(
+      `GUARD_SPAWN (${sp.x.toFixed(1)}, ${sp.z.toFixed(1)}) is outside the keep-out zone`,
+      !nearGeneralHq(sp.x, sp.z),
+      `x=${sp.x} z=${sp.z}`,
+    );
+  }
+
+  for (const [role, sp] of Object.entries(ROLE_SPAWNS) as [string, { x: number; z: number }][]) {
+    if (role === 'secretary') continue; // secretary has deliberate HQ access
+    check(
+      `ROLE_SPAWN.${role} (${sp.x}, ${sp.z}) is outside the keep-out zone`,
+      !nearGeneralHq(sp.x, sp.z),
+      `x=${sp.x} z=${sp.z}`,
+    );
+  }
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

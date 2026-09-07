@@ -17,6 +17,7 @@ import { GUARD_WEAPON, NpcWorld } from '../src/shared/npc';
 import { PlayerState } from '../src/server/PlayerState';
 import { SearchSystem } from '../src/server/SearchSystem';
 import { GameServer } from '../src/server/GameServer';
+import { CONTAINERS, HIDDEN_PISTOL_SPOTS } from '../src/shared/mapData';
 
 let failures = 0;
 function check(label: string, ok: boolean, detail = ''): void {
@@ -346,6 +347,24 @@ console.log('\n=== the item list reaches the officer and nobody else ===');
   );
 
   server.close();
+}
+
+console.log('\n=== hidden pistol spots must not overlap container reach ===');
+{
+  // containerReach and item reach are each 2.0 m, so any pistol within 4 m of a
+  // container gives the E key an ambiguous target — the player intends to pick up
+  // the pistol and ends up opening a search instead.
+  const minSep = GAME_CONFIG.world.containerReach + GAME_CONFIG.items.reach;
+  for (const spot of HIDDEN_PISTOL_SPOTS) {
+    for (const cdef of CONTAINERS) {
+      const dist = Math.hypot(spot.x - cdef.x, spot.z - cdef.z);
+      check(
+        `pistol (${spot.x},${spot.z}) is ≥${minSep}m from ${cdef.label}`,
+        dist >= minSep,
+        `${dist.toFixed(2)} m`,
+      );
+    }
+  }
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

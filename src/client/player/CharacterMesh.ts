@@ -54,6 +54,7 @@ export class CharacterMesh {
   private swingTimer = 0;
   private aiming = false;
   private dead = false;
+  private lying = false;
   private readonly bloodPuddle: THREE.Mesh;
   private bloodRadius = 0;
 
@@ -291,10 +292,20 @@ export class CharacterMesh {
 
     if (!dead) {
       this.clipDeath = false;
-      this.group.rotation.x = 0;
+      if (!this.lying) this.group.rotation.x = 0;
       this.bloodPuddle.visible = false;
       this.bloodRadius = 0;
       this.clearOneShot();
+      return;
+    }
+
+    // Lying patients stay in the lie pose — no clip, no +90° fallback.
+    if (this.lying) {
+      this.clipDeath = false;
+      this.bloodRadius = BLOOD_INITIAL;
+      this.bloodPuddle.rotation.x = -Math.PI / 2;
+      this.bloodPuddle.scale.setScalar(this.bloodRadius);
+      this.bloodPuddle.visible = true;
       return;
     }
 
@@ -343,6 +354,21 @@ export class CharacterMesh {
       this.mixer.update(0);
       this.syncHandToBone();
     }
+  }
+
+  /**
+   * Put the character in the lying-on-bed pose (patients on the ward).
+   * Pitches the group 90° and shifts it half a body-length along +Z so the
+   * figure lies centred on the mattress rather than hanging off the foot.
+   * The blood puddle counter-rotation in setDead already handles the lying case
+   * because we skip the +90° fallback there.
+   */
+  setLying(on: boolean): void {
+    if (this.lying === on) return;
+    this.lying = on;
+    // The ±z centering offset is applied inside setPose so it survives every
+    // subsequent pose call without needing to be re-added here.
+    this.group.rotation.x = on ? Math.PI / 2 : 0;
   }
 
   /** Grow the blood puddle, called when extra rounds hit the corpse. */
@@ -608,7 +634,11 @@ export class CharacterMesh {
     // Lifted slightly when the corpse hack lays a rigid body flat, or it
     // z-fights the ground. A clip-driven death lands itself and needs no help.
     const flat = this.dead && !this.clipDeath;
-    this.group.position.set(x, flat ? y + 0.06 : y, z);
+    // When lying, shift the mesh half a body-length along its local forward
+    // (+Z before rotation) so the figure is centred on the mattress rather than
+    // hanging off the foot end.
+    const lyingOffset = this.lying ? GAME_CONFIG.player.height / 2 : 0;
+    this.group.position.set(x, flat ? y + 0.06 : y, z + lyingOffset);
     this.group.rotation.y = yaw;
   }
 }

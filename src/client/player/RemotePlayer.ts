@@ -39,7 +39,8 @@ export class RemotePlayer {
   private weapon: WeaponId | null = null;
 
   /** Server-owned; the client is only told alive/dead, never a number. */
-  alive = true;
+  private _alive = true;
+  get alive(): boolean { return this._alive; }
   /** Denounced by a telegraph broadcast. Permanent for the rest of the round. */
   private flagged = false;
   /** Standing still in a Security Officer's search right now. */
@@ -108,6 +109,14 @@ export class RemotePlayer {
     this.mesh.playSwing();
   }
 
+  /** Set alive/dead, updating the mesh so the corpse actually falls down. */
+  setAlive(alive: boolean): void {
+    if (this._alive === alive) return;
+    this._alive = alive;
+    this.mesh.setDead(!alive);
+    this.refreshTag();
+  }
+
   getHit(stunDuration: number): void {
     this.mesh.playGetHit(stunDuration);
   }
@@ -123,9 +132,8 @@ export class RemotePlayer {
       this.weapon = snap.weapon;
       this.mesh.setWeapon(snap.weapon);
     }
-    if (this.alive !== snap.alive) {
-      this.alive = snap.alive;
-      this.mesh.setDead(!snap.alive);
+    if (this._alive !== snap.alive) {
+      this.setAlive(snap.alive);
     }
     if (snap.flagged === true) this.flagged = true;
     this.refreshTag();

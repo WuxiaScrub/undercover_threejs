@@ -243,6 +243,8 @@ type Npc = {
   dwell: number;
   /** Denounced by the Telegram Operator's broadcast; set for the round. */
   flagged: boolean;
+  /** Whether this NPC was inside hq_interior on the previous tick. Used to detect the inside→outside transition and close the HQ door. */
+  wasInHq: boolean;
 };
 
 const EYE = 1.55;
@@ -425,6 +427,7 @@ function makeNpc(o: NpcOptions): Npc {
     routineStop: 0,
     dwell: o.dwell ?? 0,
     flagged: false,
+    wasInHq: false,
   };
 }
 
@@ -433,6 +436,12 @@ export class NpcWorld {
   private nextId = NPC_ID_BASE;
   /** Last clock the world was ticked with — see `provoke`. */
   private nowMs = 0;
+  /**
+   * Colliders from the most recent `tick` call, so `provoke` (which is called
+   * from combat code between ticks) can raycast LOS without needing a separate
+   * collider argument. Defaults to the static compound before the first tick.
+   */
+  private lastColliders: readonly Collider[] = COMPOUND.colliders;
   /**
    * Events raised outside `tick` — `hearNoise` is called by the combat code,
    * not by the guard loop, so it has no events array to push into. Drained by
@@ -535,21 +544,22 @@ export class NpcWorld {
 
     // Static patients in the medical ward — no brain, no patrol.
     for (const post of PATIENT_POSTS) {
-      this.npcs.push(
-        makeNpc({
-          id: this.nextId++,
-          kind: 'patient',
-          role: 'doctor',
-          label: 'PATIENT',
-          x: post.x,
-          z: post.z,
-          yaw: 0,
-          maxHealth: NPC_STATS.patient.maxHealth,
-          route: [post],
-          waypoint: 0,
-          unarmed: true,
-        }),
-      );
+      const npc = makeNpc({
+        id: this.nextId++,
+        kind: 'patient',
+        role: 'doctor',
+        label: 'PATIENT',
+        x: post.x,
+        z: post.z,
+        yaw: 0,
+        maxHealth: NPC_STATS.patient.maxHealth,
+        route: [post],
+        waypoint: 0,
+        unarmed: true,
+      });
+      // Place the body on the bed surface, not on the floor.
+      npc.body.position.y = post.y;
+      this.npcs.push(npc);
     }
   }
 
@@ -646,6 +656,16 @@ export class NpcWorld {
     }
 
     const at = { x: npc.body.position.x, z: npc.body.position.z };
+
+    // The NPC that was shot knows who shot it — first-hand knowledge, no LOS required.
+    if (npc.kind === 'guard' && npc.alive) {
+      npc.provoked = true;
+      npc.targetId = byId;
+      npc.grudges.add(byId);
+      if (from) npc.lastKnown = { x: from.x, z: from.z };
+      if (npc.mode !== 'hostile') this.setMode(npc, 'hostile', this.nowMs);
+    }
+
     this.provoke(
       byId,
       at,
@@ -767,9 +787,16 @@ export class NpcWorld {
     lastKnown?: { x: number; z: number },
   ): void {
     const dest = lastKnown ?? at;
+    const colliders = this.lastColliders;
     for (const n of this.npcs) {
       if (n.kind !== 'guard' || !n.alive) continue;
       if (Math.hypot(n.body.position.x - at.x, n.body.position.z - at.z) > radius) continue;
+      // A guard is provoked only if he can see the attacker's position or the
+      // victim's position. Cheap radius check already passed; raycast now.
+      // (The victim's own provoke is handled directly in applyDamage.)
+      const canSeeAttacker = lastKnown ? this.canSeePoint(n, lastKnown, colliders) : false;
+      const canSeeVictim = this.canSeePoint(n, at, colliders);
+      if (!canSeeAttacker && !canSeeVictim) continue;
       n.provoked = true;
       n.targetId = attackerId;
       n.grudges.add(attackerId);
@@ -872,8 +899,9 @@ export class NpcWorld {
     items?: ItemField,
   ): NpcEvent[] {
     // Remembered so damage arriving between ticks (provoke) can schedule against
-    // the same clock the shooting code reads.
+    // the same clock the shooting code reads, and can raycast LOS.
     this.nowMs = nowMs;
+    this.lastColliders = colliders;
     const events: NpcEvent[] = this.pending;
     this.pending = [];
     const reach = GAME_CONFIG.world.guardDoorOpenRadius;
@@ -890,6 +918,15 @@ export class NpcWorld {
       // so does everybody else — the door is only meaningful while it is shut.
       const mayForce = npc.mode !== 'patrol' || npc.role === 'secretary';
       doors?.openNear(npc.body.position.x, npc.body.position.z, reach, mayForce);
+
+      // Track HQ entry/exit so the door closes behind any NPC who leaves.
+      // All NPCs are non-infiltrator (factions are dealt to players only) so no
+      // faction test is needed here — if NPC factions ever exist, gate this.
+      if (doors) {
+        const inHq = restrictedZoneAt(npc.body.position.x, npc.body.position.z)?.id === 'hq_interior';
+        if (npc.wasInHq && !inHq) doors.close(0); // 0 = General's HQ door
+        npc.wasInHq = inHq;
+      }
     }
     return events;
   }
@@ -1622,6 +1659,23 @@ export class NpcWorld {
       if (cos < Math.cos(cfg.viewAngle)) return false;
     }
     const dy = p.y + CHEST - eye.y;
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-3) return true;
+    const dir: Vec3 = { x: dx / len, y: dy / len, z: dz / len };
+    return !raycastColliders(eye, dir, len, colliders);
+  }
+
+  /**
+   * Thin LOS helper that avoids constructing a fake Perceivable.
+   * Tests whether an NPC's eye can reach the chest-height of an arbitrary XZ point.
+   * Skips the vision cone — provoke doesn't require the guard to be looking there.
+   */
+  private canSeePoint(npc: Npc, p: { x: number; z: number }, colliders: readonly Collider[]): boolean {
+    const pos = npc.body.position;
+    const eye: Vec3 = { x: pos.x, y: pos.y + EYE, z: pos.z };
+    const dx = p.x - eye.x;
+    const dz = p.z - eye.z;
+    const dy = CHEST - eye.y;
     const len = Math.hypot(dx, dy, dz);
     if (len < 1e-3) return true;
     const dir: Vec3 = { x: dx / len, y: dy / len, z: dz / len };

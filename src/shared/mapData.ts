@@ -276,7 +276,8 @@ const spawnPoints: Vec3[] = [
   { x: 0, y: 0, z: 8 },
   { x: -17, y: 0, z: 10 },
   { x: 17, y: 0, z: 10 },
-  { x: 0, y: 0, z: -6 },
+  // Removed {0,0,-6} — sits in the north corridor immediately outside the HQ
+  // approach zone; use nearGeneralHq() to keep future spawns clear.
 ];
 
 /**
@@ -333,7 +334,7 @@ export const RESTRICTED_ZONES: readonly RestrictedZone[] = [
     // The stretch of north corridor directly outside the one HQ door.
     min: { x: -3, z: -12 },
     max: { x: 3, z: -6 },
-    allow: ['security', 'secretary'],
+    allow: ['security', 'guard', 'secretary'],
     response: 'warn',
   },
 ];
@@ -347,6 +348,11 @@ export function restrictedZoneAt(x: number, z: number): RestrictedZone | null {
     if (x >= zone.min.x && x <= zone.max.x && z >= zone.min.z && z <= zone.max.z) return zone;
   }
   return null;
+}
+
+/** Too close to the General to be a legal spawn: either HQ zone, or within 10 m of the door at z = -12. */
+export function nearGeneralHq(x: number, z: number): boolean {
+  return restrictedZoneAt(x, z) !== null || Math.hypot(x - 0, z - (-12)) <= 10;
 }
 
 /**
@@ -536,10 +542,13 @@ export const ROLE_ROUTINES: Partial<Record<Role, readonly RoutineStop[]>> = {
   ],
 };
 
+/** Height of a patient bed (matches the prop box in the medical ward). */
+export const BED_HEIGHT = 0.6;
+
 /** Fixed positions for lying patients in the medical ward. */
-export const PATIENT_POSTS: readonly { x: number; z: number }[] = [
-  { x: 5.5, z: 4 },
-  { x: 5.5, z: 7 },
+export const PATIENT_POSTS: readonly { x: number; y: number; z: number }[] = [
+  { x: 5.5, y: BED_HEIGHT, z: 4 },
+  { x: 5.5, y: BED_HEIGHT, z: 7 },
 ];
 
 /**
@@ -548,10 +557,13 @@ export const PATIENT_POSTS: readonly { x: number; z: number }[] = [
  * these are used per round, chosen at random, so nobody can memorise the map.
  */
 export const HIDDEN_PISTOL_SPOTS: readonly Vec3[] = [
-  { x: 6.0, y: 0, z: 28.0 }, // storage, by the supply cabinet
-  { x: -5.0, y: 0, z: 4.3 }, // telegram room, by the signals drawer
+  // storage — Supply Crate {3,24.5}, Crate {4.6,24.5}, Tall Crate {3,27.5}; x=9 gives 6/4.4/7 m
+  { x: 9.0, y: 0, z: 24.0 },
+  // telegram room — moved from {-5,4.3} (1.1 m from Signals Drawer at {-5,3.2})
+  { x: -11.0, y: 0, z: 6.5 },
   { x: -12.6, y: 0, z: -4.5 }, // admin office, by the records cabinet
-  { x: 11.8, y: 0, z: 4.3 }, // medical ward, by the cabinet
+  // medical ward — moved from {11.8,4.3} (1.3 m from Medical Cabinet at {13,3.5})
+  { x: 11.5, y: 0, z: 10.5 },
   { x: 11.9, y: 0, z: -10.8 }, // waiting area, by the locker
 ];
 
@@ -644,8 +656,9 @@ export const ROLE_SPAWNS: Partial<Record<Role, Vec3>> = {
  * a player Guard begins the round standing somewhere a guard plausibly stands —
  * and never in the ring around the General.
  */
-export const GUARD_SPAWNS: readonly Vec3[] = FIELD_GUARD_POSTS.map((post) => ({
-  x: post.route[0]!.x,
-  y: 0,
-  z: post.route[0]!.z,
-}));
+export const GUARD_SPAWNS: readonly Vec3[] = FIELD_GUARD_POSTS.map((post) => {
+  // Use the first waypoint that is far enough from HQ. The chokepoint route
+  // starts at {0,-11} which is 1 m from the door — pick the first safe one.
+  const wp = post.route.find((w) => !nearGeneralHq(w.x, w.z)) ?? post.route[0]!;
+  return { x: wp.x, y: 0, z: wp.z };
+});

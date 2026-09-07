@@ -35,6 +35,7 @@ import {
   canBrandish,
   canCarry,
   startingWeapons,
+  startingVisibleWeapon,
   type WeaponId,
 } from '../../shared/weapons';
 import { Audio } from '../fx/Audio';
@@ -98,6 +99,7 @@ export class Game {
   private maxHealth = ROLE_STATS.doctor.maxHealth;
   private alive = true;
   private deadSince = 0;
+  private drawWeaponOnNextInventory = false;
   private meleeCooldown = 0;
   /** Seconds remaining where the player cannot move (melee swing root or stun). */
   private moveLock = 0;
@@ -524,8 +526,9 @@ export class Game {
     this.tickContainerSearch();
     if (this.input.wasPressed('KeyE') && !this.searchTarget) this.handleUseKey();
     // G throws away what you are holding. With nothing drawn it asks which of
-    // the things in your bag you meant.
-    if (this.input.wasPressed('KeyG')) this.handleDiscardKey();
+    // the things in your bag you meant. Suppressed while inventory is open so
+    // one keypress cannot both open the discard menu and drop the selected item.
+    if (this.input.wasPressed('KeyG') && !this.hud.isInventoryOpen()) this.handleDiscardKey();
     // Only animate a reload that actually started: pressing R on a full
     // magazine must not make the character mime one in front of a guard.
     if (this.input.wasPressed('KeyR') && this.weapons.startReload()) {
@@ -542,8 +545,12 @@ export class Game {
     }
 
     // Scroll picks WHICH weapon without changing whether it is on show.
+    // When the inventory is open the wheel scrolls the selection instead.
     const wheel = this.input.consumeWheel();
-    if (wheel !== 0) this.weapons.cycle(wheel);
+    if (wheel !== 0) {
+      if (this.hud.isInventoryOpen()) this.hud.selectInventory(wheel > 0 ? 1 : -1);
+      else this.weapons.cycle(wheel);
+    }
 
     // One click, one shot. The rifle is bolt-action and the pistol is not worth
     // making automatic; holding the button would only hide the fire interval.
@@ -988,7 +995,7 @@ export class Game {
     });
     for (const bot of this.bots) this.people.push(bot.perceivable);
 
-    const openBefore = this.doors.openIds().length;
+    const doorVersionBefore = this.doors.version;
     const events = this.npcs.tick(
       dt,
       performance.now(),
@@ -997,7 +1004,7 @@ export class Game {
       this.doors,
       this.items,
     );
-    if (this.doors.openIds().length !== openBefore) this.compound.syncDoors(this.doors);
+    if (this.doors.version !== doorVersionBefore) this.compound.syncDoors(this.doors);
     this.tickOfflinePatients(dt);
     this.npcSnapshots = this.npcs.snapshots();
 
@@ -1339,6 +1346,13 @@ export class Game {
     }
     if (!this.hud.isInventoryOpen()) return;
 
+    // ↑↓ or 1-9 to move the selection
+    if (this.input.wasPressed('ArrowUp')) this.hud.selectInventory(-1);
+    if (this.input.wasPressed('ArrowDown')) this.hud.selectInventory(1);
+    for (let i = 1; i <= 9; i++) {
+      if (this.input.wasPressed(`Digit${i}`)) this.hud.setSelected(i - 1);
+    }
+
     // [U] use the selected item
     if (this.input.wasPressed('KeyU')) {
       const sel = this.hud.selectedItem();
@@ -1383,6 +1397,17 @@ export class Game {
     const reach = GAME_CONFIG.world.containerReach;
 
     if (this.input.isDown('KeyE')) {
+      // Bending down for a pistol is the more specific intent — if there is a
+      // pickupable item in reach, let handleUseKey() claim E instead.
+      if (this.reachableItem()) {
+        if (this.searchTarget) {
+          this.searchTarget = null;
+          this.searchTimer = 0;
+          this.hud.setSearchProgress(null);
+        }
+        return;
+      }
+
       // Find nearest container in reach.
       const container = CONTAINERS.find((c) => {
         const dx = c.x - feet.x;
@@ -1520,6 +1545,9 @@ export class Game {
     this.hud.setRole(this.player.stats);
     this.maxHealth = this.player.stats.maxHealth;
     this.weapons.setRole(role);
+    // Guards spawn with the rifle visibly drawn — indistinguishable from NPC guards.
+    const vis = startingVisibleWeapon(role);
+    if (vis) this.weapons.brandishSpecific(vis);
     // Health is corrected by the server's `health` message that follows.
     this.net.setRole(role);
   }
@@ -1598,6 +1626,12 @@ export class Game {
         // and would wipe the inventory the server just told us about.
         this.setLocalRole(msg.you.role);
 
+        // The offline compound we seeded has different NPC ids than the server's
+        // round roster — clear stale actors so they are rebuilt with the right
+        // models. npcSnapshots is repopulated by the first 'snapshot' message.
+        this.npcView.clear();
+        this.npcSnapshots = [];
+
         // The offline field we seeded is not the server's; replace it wholesale
         // so our ids are the server's ids and `pickup` names the right thing.
         this.items.clear();
@@ -1656,6 +1690,11 @@ export class Game {
         this.fullInventory = msg.items;
         this.weapons.setInventory(msg.items);
         this.hud.syncInventory(msg.items);
+        if (this.drawWeaponOnNextInventory) {
+          this.drawWeaponOnNextInventory = false;
+          const vis = startingVisibleWeapon(this.player.stats.id);
+          if (vis) this.weapons.brandishSpecific(vis);
+        }
         break;
       }
 
@@ -1779,7 +1818,7 @@ export class Game {
           this.health = 0;
         } else {
           const remote = this.remotes.get(msg.id);
-          if (remote) remote.alive = false;
+          if (remote) remote.setAlive(false);
         }
         break;
       }
@@ -1788,6 +1827,8 @@ export class Game {
         if (msg.id === this.localId) {
           this.player.setPosition(msg.x, msg.y, msg.z);
           this.setAlive(true);
+          // Signal the next inventory message to brandish the role's starting weapon.
+          if (startingVisibleWeapon(this.player.stats.id)) this.drawWeaponOnNextInventory = true;
         }
         break;
       }
@@ -1811,9 +1852,10 @@ export class Game {
         if (msg.items.length === 0) {
           this.hud.showAlert('Container is empty.');
         } else {
-          this.hud.showAlert(`Found: ${msg.items.map((id) => ITEMS[id].name).join(', ')}`);
+          this.hud.showAlert(`Added to bag: ${msg.items.map((id) => ITEMS[id].name).join(', ')}`);
         }
-        // Items are already on the floor via itemsReset; local view updates from server.
+        // Inventory updated via the separate 'inventory' message; any duplicate
+        // items that couldn't fit are on the floor via 'itemsReset'.
         break;
       }
 

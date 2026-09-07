@@ -842,6 +842,141 @@ console.log('\n=== a posted sentry turns toward a noise without leaving his post
   );
 }
 
+console.log('\n=== witness-gated hostility: LOS separates bystanders from grudge-holders ===');
+{
+  /**
+   * Kill some NPC (by id), attributing the kill to SUBJECT_ID at `attackerPos`,
+   * and return whether the guard nearest to `guardPos` held a grudge.
+   *
+   * The victim's body position is wherever the world placed them. What we control
+   * is the attacker's position (`from` in applyDamage → provoke), which is all
+   * that determines whether a bystander guard witnesses the shot.
+   */
+  function killAndObserve(
+    victimId: number,
+    attackerPos: { x: number; z: number },
+    guardPos: { x: number; z: number },
+    world: NpcWorld,
+    _nowMs: number,
+  ) {
+    const guard = world.snapshots()
+      .filter((n) => n.kind === 'guard' && n.id !== victimId)
+      .sort((a, b) =>
+        Math.hypot(a.x - guardPos.x, a.z - guardPos.z) -
+        Math.hypot(b.x - guardPos.x, b.z - guardPos.z)
+      )[0]!;
+
+    world.applyDamage(victimId, 9999, SUBJECT_ID, attackerPos);
+    // Check mode immediately after applyDamage (before next tick reacts to perceivables).
+    const guardImmediately = world.snapshots().find((n) => n.id === guard.id)!;
+    const grudge = world.holdsGrudge(guard.id, SUBJECT_ID);
+    return { grudge, mode: guardImmediately.mode, guardId: guard.id };
+  }
+
+  // (i) Kill a guard deep inside Admin Office. Attacker at {-17, -5} (inside room).
+  // The bystander guard in the west corridor can't see through the inner wall.
+  {
+    const world = new NpcWorld();
+    let now = 1000;
+    world.tick(DT, now, [], COMPOUND.colliders);
+
+    // Victim: the guard nearest to the Admin Office position.
+    const victim = world.snapshots()
+      .filter((n) => n.kind === 'guard')
+      .sort((a, b) =>
+        Math.hypot(a.x - (-17), a.z - (-5)) -
+        Math.hypot(b.x - (-17), b.z - (-5))
+      )[0]!;
+
+    const r = killAndObserve(victim.id, { x: -17, z: -5 }, { x: -6, z: 0 }, world, now);
+    check(
+      '(i) kill attributed to attacker behind a wall — bystander guard has no grudge',
+      !r.grudge,
+      `grudge=${r.grudge} mode=${r.mode}`,
+    );
+    check(
+      '(i) that guard investigates (heard the kill) but is not immediately hostile',
+      r.mode !== 'hostile',
+      `mode=${r.mode}`,
+    );
+  }
+
+  // (ii) Kill in clear line of sight — attacker at {0, -4} in the open north corridor.
+  // The chokepoint guard at {2, -10} has clear sight down the corridor.
+  {
+    const world = new NpcWorld();
+    let now = 1000;
+    world.tick(DT, now, [], COMPOUND.colliders);
+
+    // Victim: any guard that is not the chokepoint sentry.
+    const chokeGuard = world.snapshots()
+      .filter((n) => n.kind === 'guard')
+      .sort((a, b) =>
+        Math.hypot(a.x - 2, a.z - (-10)) -
+        Math.hypot(b.x - 2, b.z - (-10))
+      )[0]!;
+
+    // Victim must not be the chokepoint guard itself — pick another guard.
+    const victim = world.snapshots()
+      .filter((n) => n.kind === 'guard' && n.id !== chokeGuard.id)[0]!;
+
+    const r = killAndObserve(victim.id, { x: 0, z: -4 }, { x: 2, z: -10 }, world, now);
+    check(
+      '(ii) kill in open corridor — chokepoint guard holds the grudge',
+      r.grudge,
+      `grudge=${r.grudge} mode=${r.mode}`,
+    );
+    check(
+      '(ii) and goes hostile',
+      r.mode === 'hostile',
+      `mode=${r.mode}`,
+    );
+  }
+
+  // (iii) The victim NPC itself goes hostile regardless of LOS (first-hand knowledge).
+  {
+    const world = new NpcWorld();
+    let now = 1000;
+    world.tick(DT, now, [], COMPOUND.colliders);
+
+    // Pick a guard far from the chokepoint so it hasn't already been provoked.
+    const guard = world.snapshots().find(
+      (n) => n.kind === 'guard' && Math.hypot(n.x - 0, n.z - (-10)) > 5,
+    )!;
+    // Shoot but not kill, so we can check the guard's live mode immediately.
+    world.applyDamage(guard.id, 10, SUBJECT_ID, { x: -20, z: 0 }); // attacker behind a wall
+    // Check immediately after applyDamage — applyDamage sets mode to hostile directly.
+    const after = world.snapshots().find((n) => n.id === guard.id)!;
+    check(
+      '(iii) a guard that was shot goes hostile regardless of attacker LOS',
+      after.mode === 'hostile' && world.holdsGrudge(guard.id, SUBJECT_ID),
+      `mode=${after.mode} grudge=${world.holdsGrudge(guard.id, SUBJECT_ID)}`,
+    );
+  }
+}
+
+console.log('\n=== guard role: HQ approach allowed, interior shoot-on-sight ===');
+{
+  // A player Guard standing in the approach zone (just outside the door) should
+  // not trigger any violation — 'guard' was added to hq_approach.allow for this.
+  const guardAtApproach = run({ role: 'guard', weapon: null, x: 0, z: -8, seconds: 6 });
+  check(
+    'player Guard at approach (z=-8) → no warning, no shots',
+    guardAtApproach.worst === 'patrol' && guardAtApproach.shotsAtSubject === 0,
+    `worst=${guardAtApproach.worst} shots=${guardAtApproach.shotsAtSubject}`,
+  );
+
+  // But stepping inside the General's office is still forbidden.
+  const guardInsideHq = run({ role: 'guard', weapon: null, x: 0, z: -15, seconds: 6 });
+  check(
+    'player Guard INSIDE the HQ (z=-15) → shot, no warning',
+    guardInsideHq.worst === 'hostile' &&
+      guardInsideHq.shotsAtSubject > 0 &&
+      !guardInsideHq.modes.has('warning'),
+    `worst=${guardInsideHq.worst} shots=${guardInsideHq.shotsAtSubject}`,
+  );
+}
+
 console.log('\n=== patrol routes are walkable ===');
 for (const post of GUARD_POSTS) {
   if (post.route.length < 2) continue;

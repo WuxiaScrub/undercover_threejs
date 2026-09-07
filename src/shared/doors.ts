@@ -152,6 +152,8 @@ export function doorHinge(def: DoorDef): { x: number; z: number } {
 export class DoorField {
   private readonly open = new Set<number>();
   private cache: readonly Collider[] | null = null;
+  /** Monotonically incremented on every state change — safer broadcast trigger than openIds().length. */
+  version = 0;
 
   isOpen(id: number): boolean {
     return this.open.has(id);
@@ -167,7 +169,16 @@ export class DoorField {
     if (this.open.has(id)) this.open.delete(id);
     else this.open.add(id);
     this.cache = null;
+    this.version++;
     return this.open.has(id);
+  }
+
+  /** Close an open door. No-op if already shut or id unknown. */
+  close(id: number): void {
+    if (!BY_ID.has(id) || !this.open.has(id)) return;
+    this.open.delete(id);
+    this.cache = null;
+    this.version++;
   }
 
   /** Adopt a full state from the server. */
@@ -175,6 +186,7 @@ export class DoorField {
     this.open.clear();
     for (const id of open) if (BY_ID.has(id)) this.open.add(id);
     this.cache = null;
+    this.version++;
   }
 
   /**
@@ -195,7 +207,7 @@ export class DoorField {
       this.open.add(def.id);
       (changed ??= []).push(def.id);
     }
-    if (changed) this.cache = null;
+    if (changed) { this.cache = null; this.version++; }
     return changed ?? [];
   }
 

@@ -183,6 +183,15 @@ export class WeaponSystem {
     this.enforce();
   }
 
+  /** Select and draw a specific weapon. Used at spawn for roles that start armed. */
+  brandishSpecific(id: WeaponId): void {
+    if (!this.owned.has(id)) return;
+    this.held = id;
+    this.visible = true;
+    this.reloadLeft = 0;
+    this.enforce();
+  }
+
   /** Throw away the selected weapon. Returns what left your hands. */
   drop(): WeaponId | null {
     const dropped = this.held;

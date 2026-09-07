@@ -126,7 +126,6 @@ export class Connection {
 
 /** Default server for this page: whoever served the client is hosting the game. */
 export function defaultServerUrl(): string {
-  const host = window.location.hostname || 'localhost';
   const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${scheme}://${host}:3000`;
+  return `${scheme}://${window.location.host}/ws`;
 }

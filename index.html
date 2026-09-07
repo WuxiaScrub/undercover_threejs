@@ -132,6 +132,13 @@
         color: #8f8c80;
         text-shadow: 0 1px 2px #000;
       }
+      #hud-inventory-hint {
+        margin-top: 4px;
+        font-size: 9px;
+        letter-spacing: 1px;
+        color: #5f5c50;
+        text-shadow: 0 1px 2px #000;
+      }
       #prompt {
         position: fixed;
         left: 50%;
@@ -623,11 +630,12 @@
       <div id="hud-stamina"><div id="hud-stamina-fill"></div></div>
       <div id="hud-weapon">UNARMED</div>
       <div id="hud-kit">CARRYING NOTHING</div>
+      <div id="hud-inventory-hint">[I] INVENTORY</div>
     </div>
     <div id="inventory">
       <div id="inventory-title">INVENTORY</div>
       <div id="inventory-list"></div>
-      <div id="inventory-hint">[U] use  ·  [G] drop  ·  [I] close</div>
+      <div id="inventory-hint">[↑↓/1-9] select · [U] use · [G] drop · [I] close</div>
     </div>
     <div id="chat">
       <div id="chat-log"></div>

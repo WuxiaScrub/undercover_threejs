@@ -20,7 +20,7 @@ import { PROTOCOL_VERSION, type ClientMessage, type ServerMessage } from '../src
 import { GameServer } from '../src/server/GameServer';
 import { medicalStatus } from '../src/shared/duty';
 import { PatientSystem } from '../src/shared/medical';
-import { COMPOUND, PATIENT_POSTS } from '../src/shared/mapData';
+import { BED_HEIGHT, COMPOUND, PATIENT_POSTS } from '../src/shared/mapData';
 import { NpcWorld } from '../src/shared/npc';
 import { PlayerState } from '../src/server/PlayerState';
 import { RoundSystem } from '../src/server/RoundSystem';
@@ -336,6 +336,51 @@ console.log('\n=== the compound is told which kind of death it was ===');
   server['tickRound'](server['livePlayers'](), now + 2000);
   check('losing both patients ends the round', server['round'].phase === 'over', server['round'].phase);
   server.close();
+}
+
+console.log('\n=== patients lie on the beds at BED_HEIGHT ===');
+{
+  const npcs = new NpcWorld();
+  npcs.reset();
+  npcs.tick(DT, 0, [], COMPOUND.colliders);
+
+  for (const id of npcs.patientIds) {
+    const snap = npcs.snapshots().find((s) => s.id === id)!;
+    check(
+      `patient ${id} snapshot y is BED_HEIGHT (${BED_HEIGHT})`,
+      Math.abs(snap.y - BED_HEIGHT) < 0.01,
+      `y=${snap.y.toFixed(3)}`,
+    );
+    check(
+      `patient ${id} snapshot pose is 'lie'`,
+      snap.pose === 'lie',
+      `pose=${snap.pose}`,
+    );
+  }
+}
+
+console.log('\n=== a dead patient stays lying (does not sit up) ===');
+{
+  const npcs = new NpcWorld();
+  npcs.reset();
+  npcs.tick(DT, 0, [], COMPOUND.colliders);
+
+  const id = npcs.patientIds[0]!;
+  // Kill the first patient with a fatal shot.
+  for (let i = 0; i < 20 && npcs.snapshots().find((s) => s.id === id)?.alive !== false; i++) {
+    npcs.applyDamage(id, 999, SHOOTER);
+  }
+  const snap = npcs.snapshots().find((s) => s.id === id)!;
+  check(
+    'dead patient snapshot: alive=false',
+    snap.alive === false,
+    `alive=${snap.alive}`,
+  );
+  check(
+    'dead patient snapshot: pose still lie',
+    snap.pose === 'lie',
+    `pose=${snap.pose}`,
+  );
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

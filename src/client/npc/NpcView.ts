@@ -41,7 +41,13 @@ class NpcActor {
   private aiming = false;
   private dead = false;
 
+  /** Snapshot identity — used to detect when a round reset changed this id's role. */
+  readonly kind: NpcSnapshot['kind'];
+  readonly role: NpcSnapshot['role'];
+
   constructor(snap: NpcSnapshot) {
+    this.kind = snap.kind;
+    this.role = snap.role;
     const stats = NPC_STATS[snap.kind];
     this.mesh = new CharacterMesh(stats.color, stats.headColor);
     this.mesh.setModel(modelFor(snap));
@@ -72,12 +78,8 @@ class NpcActor {
       this.mesh.setDead(this.dead);
     }
 
-    // Lying pose for patients.
-    if (snap.pose === 'lie' && snap.alive) {
-      this.mesh.group.rotation.x = Math.PI / 2;
-    } else if (this.mesh.group.rotation.x !== 0) {
-      this.mesh.group.rotation.x = 0;
-    }
+    // Lying pose for patients — keep it even when dead so they don't sit up.
+    this.mesh.setLying(snap.pose === 'lie');
 
     // Nothing about the guard state machine reaches the tag any more: a man who
     // has just decided to shoot you looks exactly like a man on his rounds, and
@@ -152,6 +154,15 @@ export class NpcView {
   apply(snaps: readonly NpcSnapshot[], searching?: ReadonlySet<number>): void {
     for (const snap of snaps) {
       let actor = this.actors.get(snap.id);
+      // Recreate the actor if the id's kind or role changed — this happens when
+      // a round starts and the roster reuses ids that had different roles offline.
+      // NpcActor sets its model once in the constructor, so a stale actor would
+      // keep the wrong mesh forever.
+      if (actor && (actor.kind !== snap.kind || actor.role !== snap.role)) {
+        actor.dispose();
+        this.actors.delete(snap.id);
+        actor = undefined;
+      }
       if (!actor) {
         actor = new NpcActor(snap);
         this.actors.set(snap.id, actor);

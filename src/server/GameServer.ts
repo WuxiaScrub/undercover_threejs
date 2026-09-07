@@ -261,11 +261,22 @@ export class GameServer {
           this.send(conn, { t: 'alert', text: 'Container already searched.' });
           break;
         }
-        // Spill items on the floor near the container.
         if (found.length > 0) {
-          this.items.spill(found, cdef.x, 0, cdef.z);
-          this.broadcast({ t: 'itemsReset', items: this.items.list() });
-    this.broadcast({ t: 'patients', patients: this.patients.publicUpdates() });
+          // Items go directly to the player's inventory; only true duplicates
+          // (inventory is a Set so no stacks) are spilled on the floor.
+          const spilled: typeof found = [];
+          for (const item of found) {
+            if (state.inventory.has(item)) {
+              spilled.push(item);
+            } else {
+              state.inventory.add(item);
+            }
+          }
+          this.send(conn, { t: 'inventory', items: state.inventoryList });
+          if (spilled.length > 0) {
+            this.items.spill(spilled, cdef.x, 0, cdef.z);
+            this.broadcast({ t: 'itemsReset', items: this.items.list() });
+          }
         }
         this.send(conn, { t: 'container', id: msg.id, items: found });
         break;
@@ -661,10 +672,10 @@ export class GameServer {
 
     const players = this.livePlayers();
     if (players.length > 0) {
-      const before = this.doors.openIds().length;
+      const doorVersionBefore = this.doors.version;
       this.dispatch(null, this.guards.tick(dt, nowWall, players, this.doors, this.items));
-      // Guards push doors open as they walk into them; everyone has to be told.
-      if (this.doors.openIds().length !== before) {
+      // Guards push doors open (or close the HQ door) as they move; tell everyone.
+      if (this.doors.version !== doorVersionBefore) {
         this.broadcast({ t: 'doors', open: this.doors.openIds() });
       }
     }
